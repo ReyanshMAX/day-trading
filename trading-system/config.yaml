@@ -1,0 +1,60 @@
+universe:
+  tickers:
+    - NVDA
+    - AAPL
+    - MSFT
+    - TSLA
+    - META
+    - GOOGL
+    - AMZN
+    - AMD
+    - SPY
+    - QQQ
+    - SOFI
+    - PLTR
+    - COIN
+    - MSTR
+    - ARKK
+
+account:
+  paper: true
+  nav: 100000
+
+risk:
+  max_trade_risk_pct: 0.01
+  max_portfolio_heat_pct: 0.06
+  max_sector_positions: 4
+  daily_loss_limit_pct: 0.03
+
+signal:
+  entry_threshold: 0.55
+  atr_period: 14
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  vwap_deviation_bands: [1.0, 2.0, 2.5]
+  orb_window_minutes: 15
+
+regime:
+  news_poll_interval_seconds: 120
+  min_conviction_to_trade: 3
+
+rr_profiles:
+  trending:
+    stop_atr_mult: 1.5
+    target_atr_mult: 3.0
+    size_multiplier_by_conviction:
+      1: 0.25
+      2: 0.5
+      3: 0.75
+      4: 1.0
+      5: 1.25
+  ranging:
+    stop_atr_mult: 1.0
+    target_atr_mult: 1.5
+    size_multiplier_by_conviction:
+      1: 0.0
+      2: 0.25
+      3: 0.5
+      4: 0.75
+      5: 1.0
