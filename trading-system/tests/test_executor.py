@@ -76,6 +76,7 @@ def _make_executor(
 
     config = MagicMock()
     config.risk.max_trade_risk_pct = 0.01
+    config.risk.max_portfolio_heat_pct = 0.06
 
     executor = Executor(broker, portfolio, signal_engine, order_manager, risk_gate, config)
     return executor, broker, portfolio, signal_engine, order_manager, risk_gate

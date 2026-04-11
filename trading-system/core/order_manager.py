@@ -10,12 +10,16 @@ from dataclasses import dataclass
 
 from core.config import Config
 
+
+def _is_crypto(ticker: str) -> bool:
+    return "/" in ticker or (ticker.endswith("USD") and len(ticker) > 4)
+
 log = logging.getLogger(__name__)
 
 
 @dataclass
 class BracketParams:
-    qty: int
+    qty: float   # int for equities, fractional float for crypto
     stop: float
     target: float
     stop_distance: float
@@ -100,23 +104,39 @@ class OrderManager:
 
         # Recompute actual stop distance after potential snap
         actual_stop_dist = abs(entry - raw_stop)
-        base_qty = compute_base_size(
-            self._config.account.nav,
-            actual_stop_dist,
-            self._config.risk.max_trade_risk_pct,
-        )
-        qty = max(1, int(base_qty * size_mult))
-
-        # Hard cap: notional value must not exceed max_position_pct of NAV.
-        # Without this, a tiny ATR-derived stop produces a massive share count.
         max_notional = self._config.account.nav * self._config.risk.max_position_pct
-        max_qty_by_notional = max(1, math.floor(max_notional / entry))
-        if qty > max_qty_by_notional:
-            log.warning(
-                "%s qty capped by notional: %d -> %d (entry=%.2f max_notional=%.0f)",
-                ticker, qty, max_qty_by_notional, entry, max_notional,
+
+        if _is_crypto(ticker):
+            # Crypto supports fractional units — size in 4 decimal places (e.g. 0.0137 BTC)
+            risk_dollars = self._config.account.nav * self._config.risk.max_trade_risk_pct
+            raw_qty = (risk_dollars / actual_stop_dist) * size_mult if actual_stop_dist > 0 else 0
+            qty_cap = max_notional / entry
+            qty_float = round(min(raw_qty, qty_cap), 4)
+            if qty_float <= 0:
+                raise ValueError(
+                    f"{ticker} fractional size resolved to 0 "
+                    f"(stop_dist={actual_stop_dist:.4f}, max_notional=${max_notional:.0f})"
+                )
+            qty = qty_float
+        else:
+            base_qty = compute_base_size(
+                self._config.account.nav,
+                actual_stop_dist,
+                self._config.risk.max_trade_risk_pct,
             )
-            qty = max_qty_by_notional
+            qty = max(1, int(base_qty * size_mult))
+            max_qty_by_notional = math.floor(max_notional / entry)
+            if max_qty_by_notional < 1:
+                raise ValueError(
+                    f"{ticker} unit price ${entry:.2f} exceeds max notional "
+                    f"${max_notional:.0f} ({self._config.risk.max_position_pct:.0%} of NAV) — skipping"
+                )
+            if qty > max_qty_by_notional:
+                log.warning(
+                    "%s qty capped by notional: %d -> %d (entry=%.2f max_notional=%.0f)",
+                    ticker, qty, max_qty_by_notional, entry, max_notional,
+                )
+                qty = max_qty_by_notional
 
         # Validate bracket invariant
         if direction == "long":
@@ -131,8 +151,12 @@ class OrderManager:
                 )
 
         log.info(
-            "%s %s qty=%d entry=%.2f stop=%.2f target=%.2f atr=%.4f mult=%.2f",
-            ticker, direction, qty, entry, raw_stop, raw_target, atr, size_mult,
+            "%s %s qty=%s entry=%s stop=%s target=%s atr=%.5f mult=%.2f",
+            ticker, direction, qty,
+            f"{entry:.5f}".rstrip("0").rstrip("."),
+            f"{raw_stop:.5f}".rstrip("0").rstrip("."),
+            f"{raw_target:.5f}".rstrip("0").rstrip("."),
+            atr, size_mult,
         )
 
         return BracketParams(

@@ -4,16 +4,19 @@ Single responsibility: coordinate bar_store, indicators, regime_store,
 and scoring to produce a SignalResult or None per tick.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
 from core.config import Config
 from signals.bar_store import BarStore
-from signals.indicators import ema, vwap, vwap_bands, atr, rsi, macd, rvol, orb, detect_swing_high, detect_swing_low
+from signals.indicators import ema, vwap, vwap_bands, atr, rsi, macd, rvol, orb
 from signals.scoring import compute_score, IndicatorSnapshot, RegimeState
 from regime.regime_store import RegimeStore
 
 log = logging.getLogger(__name__)
+
+_SCORE_LOG_INTERVAL = 30.0  # seconds between heartbeat logs per ticker
 
 
 @dataclass
@@ -35,14 +38,10 @@ class SignalEngine:
         self._bar_store = bar_store
         self._regime_store = regime_store
 
-    def on_tick(self, ticker: str, price: float, volume: float, timestamp) -> SignalResult | None:
-        """Process a single tick. Returns SignalResult or None."""
-        from datetime import datetime
-        self._bar_store.update(ticker, price, volume, timestamp)
-
+    def _compute(self, ticker: str, price: float) -> tuple[IndicatorSnapshot, float, RegimeState] | None:
+        """Compute indicators and score for a ticker. Returns None if not ready."""
         df = self._bar_store.get_bars(ticker, 100)
         if len(df) < 20:
-            log.debug("%s: not enough bars (%d), skipping", ticker, len(df))
             return None
 
         regime_state = self._regime_store.get(ticker)
@@ -86,12 +85,19 @@ class SignalEngine:
         if score is None:
             return None
 
-        log.debug(
-            "%s score=%.3f ema_fast=%.2f ema_slow=%.2f rsi=%.1f rvol=%.2f",
-            ticker, score, ema_fast_val, ema_slow_val, rsi_val, rvol_val,
-        )
+        return snapshot, score, regime_state
 
-        if abs(score) < cfg.entry_threshold:
+    def on_tick(self, ticker: str, price: float, volume: float, timestamp) -> SignalResult | None:
+        """Process a single tick. Returns SignalResult or None."""
+        self._bar_store.update(ticker, price, volume, timestamp)
+
+        result = self._compute(ticker, price)
+        if result is None:
+            return None
+
+        snapshot, score, regime_state = result
+
+        if abs(score) < self._config.signal.entry_threshold:
             return None
 
         direction = "long" if score > 0 else "short"
@@ -100,8 +106,45 @@ class SignalEngine:
             ticker=ticker,
             score=score,
             direction=direction,
-            atr=atr_val,
+            atr=snapshot.atr,
             regime=regime_state.regime,
             conviction=regime_state.conviction,
             indicators=snapshot,
         )
+
+    async def log_scores_loop(self, tickers: list[str]) -> None:
+        """Log indicator snapshots for all tickers every _SCORE_LOG_INTERVAL seconds."""
+        # Stagger startup so tickers don't all log at the same instant
+        interval = _SCORE_LOG_INTERVAL
+        stagger = interval / len(tickers) if tickers else interval
+
+        for i, ticker in enumerate(tickers):
+            await asyncio.sleep(stagger * i)
+            asyncio.create_task(self._ticker_log_loop(ticker, interval))
+
+        # Keep the coroutine alive
+        await asyncio.Event().wait()
+
+    async def _ticker_log_loop(self, ticker: str, interval: float) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            price = self._bar_store.get_current_price(ticker)
+            if price is None:
+                log.info("%s — no price yet", ticker)
+                continue
+
+            result = self._compute(ticker, price)
+            if result is None:
+                df = self._bar_store.get_bars(ticker, 100)
+                log.info("%s — bars=%d (need 20 to score)", ticker, len(df))
+                continue
+
+            snapshot, score, regime_state = result
+            cfg = self._config.signal
+            log.info(
+                "%s score=%.3f rsi=%.1f rvol=%.2f vwap=%.2f price=%.2f vwap_std=%.4f "
+                "ema_fast=%.2f ema_slow=%.2f regime=%s conviction=%d threshold=%.2f",
+                ticker, score, snapshot.rsi, snapshot.rvol, snapshot.vwap, price, snapshot.vwap_std,
+                snapshot.ema_fast, snapshot.ema_slow,
+                regime_state.regime, regime_state.conviction, cfg.entry_threshold,
+            )

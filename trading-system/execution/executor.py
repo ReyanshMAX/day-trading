@@ -54,7 +54,10 @@ class Executor:
                 return
 
             # 3. Fast pre-check: skip bracket build if portfolio heat already maxed
-            if self._portfolio.open_risk_pct() >= self._config.risk.max_portfolio_heat_pct:
+            heat = self._portfolio.open_risk_pct()
+            if heat >= self._config.risk.max_portfolio_heat_pct:
+                log.debug("%s — skipping: portfolio heat %.2f%% >= %.0f%%",
+                          ticker, heat * 100, self._config.risk.max_portfolio_heat_pct * 100)
                 return
 
             # 4. Compute Fibonacci levels from swing data
@@ -98,11 +101,12 @@ class Executor:
                 bracket.stop,
                 bracket.target,
             )
-            self._portfolio.record_fill(order, stop=bracket.stop, target=bracket.target)
+            self._portfolio.record_fill(order, stop=bracket.stop, target=bracket.target, entry_price=price)
             log.info(
-                "Order fired: %s %s qty=%d stop=%.2f target=%.2f score=%.3f regime=%s conviction=%d",
+                "Order fired: %s %s qty=%s stop=%s target=%s score=%.3f regime=%s conviction=%d",
                 ticker, signal.direction, bracket.qty,
-                bracket.stop, bracket.target,
+                f"{bracket.stop:.5f}".rstrip("0").rstrip("."),
+                f"{bracket.target:.5f}".rstrip("0").rstrip("."),
                 signal.score, signal.regime, signal.conviction,
             )
 

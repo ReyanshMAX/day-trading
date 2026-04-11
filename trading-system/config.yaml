@@ -17,6 +17,9 @@ universe:
     - ARKK
     - BTC/USD
     - ETH/USD
+    - SOL/USD
+    - AVAX/USD
+    - DOGE/USD
 
 account:
   paper: true
@@ -30,7 +33,7 @@ risk:
   daily_loss_limit_pct: 0.03
 
 signal:
-  entry_threshold: 0.55
+  entry_threshold: 0.25
   atr_period: 14
   ema_fast: 9
   ema_slow: 21

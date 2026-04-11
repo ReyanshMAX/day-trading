@@ -89,18 +89,22 @@ async def main() -> None:
     shutdown = asyncio.Event()
 
     log.info("Starting stream and watchers...")
+    crypto_tickers = [t for t in config.universe.tickers if _is_crypto(t)]
+
     stream_task = asyncio.create_task(
         stream.start(config.universe.tickers, executor.on_tick,
                      api_key=config.alpaca_api_key, secret_key=config.alpaca_secret_key)
     )
     watch_task = asyncio.create_task(news_watcher.watch())
     eod_task = asyncio.create_task(close_all_positions_eod(broker, portfolio, shutdown))
+    score_log_task = asyncio.create_task(signal_engine.log_scores_loop(crypto_tickers))
 
     await shutdown.wait()
     log.info("Shutdown event set — cancelling stream and news watcher.")
     stream_task.cancel()
     watch_task.cancel()
-    await asyncio.gather(stream_task, watch_task, eod_task, return_exceptions=True)
+    score_log_task.cancel()
+    await asyncio.gather(stream_task, watch_task, eod_task, score_log_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

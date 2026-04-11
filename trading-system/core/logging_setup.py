@@ -46,7 +46,7 @@ def configure_logging(log_dir: str = "logs") -> None:
     console_handler = logging.StreamHandler(
         stream=io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", line_buffering=True)
     )
-    console_handler.setLevel(logging.WARNING)
+    console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
     root = logging.getLogger()

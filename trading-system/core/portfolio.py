@@ -5,7 +5,7 @@ Does not call the broker directly — updated via record_fill/record_close callb
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -16,13 +16,14 @@ SECTOR_MAP: dict[str, str] = {
     "PLTR": "tech", "SOFI": "finance", "ARKK": "etf",
     "SPY": "etf", "QQQ": "etf",
     "BTC/USD": "crypto", "ETH/USD": "crypto",
+    "SOL/USD": "crypto", "AVAX/USD": "crypto", "DOGE/USD": "crypto",
 }
 
 
 @dataclass
 class Position:
     ticker: str
-    qty: int
+    qty: float   # float to support fractional crypto units
     avg_entry: float
     stop: float
     target: float
@@ -62,13 +63,19 @@ class Portfolio:
                 count += 1
         return count
 
-    def record_fill(self, order, stop: float = 0.0, target: float = 0.0) -> None:
-        """Record a new position from an order fill."""
+    def record_fill(self, order, stop: float = 0.0, target: float = 0.0, entry_price: float = 0.0) -> None:
+        """Record a new position from an order fill.
+
+        entry_price is used as a fallback when filled_avg_price is not yet
+        populated (paper market orders return before fill confirmation).
+        Using 0 as fallback would inflate open_risk by ~entry * qty and
+        silently block all subsequent orders via the heat pre-check.
+        """
         try:
             ticker = str(order.symbol)
-            qty = int(order.qty)
+            qty = float(order.qty)
             side = "long" if str(order.side).lower() in ("buy", "orderside.buy") else "short"
-            entry = float(order.filled_avg_price or order.limit_price or 0.0)
+            entry = float(order.filled_avg_price or order.limit_price or entry_price or 0.0)
             self.positions[ticker] = Position(
                 ticker=ticker,
                 qty=qty,

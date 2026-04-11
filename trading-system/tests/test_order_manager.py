@@ -17,6 +17,7 @@ def make_config() -> Config:
         risk=RiskConfig(
             max_trade_risk_pct=0.01,
             max_portfolio_heat_pct=0.06,
+            max_position_pct=0.10,
             max_sector_positions=4,
             daily_loss_limit_pct=0.03,
         ),
