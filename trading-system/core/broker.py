@@ -158,12 +158,12 @@ class AlpacaBroker:
         filled_float = float(raw_filled) if raw_filled is not None else 0.0
         exit_qty = math.floor(filled_float * 1e8) / 1e8 if filled_float > 0 else math.floor(qty * 0.9975 * 1e8) / 1e8
 
-        # 2. Stop-loss (stop-limit with 0.1% limit buffer below stop)
+        # 2. Stop-loss (hard stop-limit order on Alpaca — risk protection first).
         # NOTE: Alpaca locks the full crypto balance when any GTC exit order is
-        # pending. Submitting both stop-loss AND take-profit simultaneously causes
-        # the second order to fail with "insufficient balance". Only the stop-loss
-        # is submitted here (risk protection first). The take-profit is handled by
-        # the EOD close-all sweep or future fill-event monitoring.
+        # pending, so only ONE exit order can be live at a time. The stop-loss is
+        # placed as the hard order; the take-profit is enforced softly by the
+        # executor's tick loop (executor.on_tick checks price vs pos.target and
+        # submits a market close when the target level is reached).
         dp = _price_decimals(stop_price)
         stop_rounded = round(stop_price, dp)
         stop_limit = round(stop_price * (0.999 if side == "long" else 1.001), dp)
@@ -182,8 +182,8 @@ class AlpacaBroker:
             log.error("Crypto stop-loss order failed for %s: %s", ticker, e)
 
         log.info(
-            "Crypto take-profit skipped for %s (target=%.4f): Alpaca locks balance on "
-            "pending stop-loss; EOD sweep will close at market",
+            "Crypto take-profit for %s is soft (tick-based): target=%.4f "
+            "enforced by executor on_tick",
             ticker, take_profit_price,
         )
 

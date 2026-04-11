@@ -44,6 +44,34 @@ class Executor:
             if not await self._broker.is_tradable(ticker):
                 return
 
+            # 0. Soft take-profit for crypto positions.
+            # Alpaca locks the full crypto balance behind the pending stop-loss GTC
+            # order, so a second hard take-profit order would be rejected. Instead,
+            # we monitor price against pos.target on every tick and submit a market
+            # close when the target is reached.
+            _is_crypto = "/" in ticker or (ticker.endswith("USD") and len(ticker) > 4)
+            if _is_crypto:
+                pos = self._portfolio.positions.get(ticker)
+                if pos is not None:
+                    hit_target = (
+                        (pos.side == "long" and price >= pos.target) or
+                        (pos.side == "short" and price <= pos.target)
+                    )
+                    if hit_target:
+                        log.info(
+                            "Soft take-profit triggered for %s: price=%.5f target=%.5f — closing position",
+                            ticker, price, pos.target,
+                        )
+                        try:
+                            close_side = "sell" if pos.side == "long" else "buy"
+                            close_order = await self._broker.submit_market_order(
+                                ticker, pos.qty, close_side
+                            )
+                            self._portfolio.record_close(close_order)
+                        except Exception as tp_err:
+                            log.error("Soft take-profit close failed for %s: %s", ticker, tp_err)
+                        return
+
             # 1. Run signal engine
             signal = self._signal_engine.on_tick(ticker, price, volume, timestamp)
             if signal is None:

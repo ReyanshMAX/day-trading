@@ -29,11 +29,11 @@ risk:
   max_trade_risk_pct: 0.01
   max_position_pct: 0.10
   max_portfolio_heat_pct: 0.06
-  max_sector_positions: 4
+  max_sector_positions: 5
   daily_loss_limit_pct: 0.03
 
 signal:
-  entry_threshold: 0.25
+  entry_threshold: 0.35
   atr_period: 14
   ema_fast: 9
   ema_slow: 21
