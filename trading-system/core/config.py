@@ -29,6 +29,7 @@ class AccountConfig:
 @dataclass
 class RiskConfig:
     max_trade_risk_pct: float
+    max_position_pct: float
     max_portfolio_heat_pct: float
     max_sector_positions: int
     daily_loss_limit_pct: float
@@ -123,6 +124,7 @@ def load_config(config_path: str | None = None) -> Config:
         ),
         risk=RiskConfig(
             max_trade_risk_pct=float(raw["risk"]["max_trade_risk_pct"]),
+            max_position_pct=float(raw["risk"]["max_position_pct"]),
             max_portfolio_heat_pct=float(raw["risk"]["max_portfolio_heat_pct"]),
             max_sector_positions=int(raw["risk"]["max_sector_positions"]),
             daily_loss_limit_pct=float(raw["risk"]["daily_loss_limit_pct"]),

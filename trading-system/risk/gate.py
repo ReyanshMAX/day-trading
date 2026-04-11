@@ -48,7 +48,7 @@ def check(
 
     # 3. Portfolio heat
     if portfolio.open_risk_pct() >= config.risk.max_portfolio_heat_pct:
-        log.warning(
+        log.debug(
             "%s | %s | REJECT: portfolio heat %.2f%% >= %.0f%%",
             now, ticker, portfolio.open_risk_pct() * 100, config.risk.max_portfolio_heat_pct * 100,
         )
@@ -57,7 +57,7 @@ def check(
     # 4. Trade risk
     trade_risk = qty * stop_distance
     if portfolio.nav > 0 and (trade_risk / portfolio.nav) > config.risk.max_trade_risk_pct:
-        log.warning(
+        log.debug(
             "%s | %s | REJECT: trade risk %.2f%% > %.0f%%",
             now, ticker, (trade_risk / portfolio.nav) * 100, config.risk.max_trade_risk_pct * 100,
         )
@@ -66,7 +66,7 @@ def check(
     # 5. Sector concentration
     sector = SECTOR_MAP.get(ticker, "other")
     if portfolio.sector_count(sector) >= config.risk.max_sector_positions:
-        log.warning(
+        log.debug(
             "%s | %s | REJECT: sector '%s' at max %d positions",
             now, ticker, sector, config.risk.max_sector_positions,
         )

@@ -53,7 +53,11 @@ class Executor:
             if self._portfolio.has_position(ticker):
                 return
 
-            # 3. Compute Fibonacci levels from swing data
+            # 3. Fast pre-check: skip bracket build if portfolio heat already maxed
+            if self._portfolio.open_risk_pct() >= self._config.risk.max_portfolio_heat_pct:
+                return
+
+            # 4. Compute Fibonacci levels from swing data
             df = self._signal_engine._bar_store.get_bars(ticker, 50)
             fib = None
             if len(df) >= 20:
@@ -62,7 +66,7 @@ class Executor:
                 if sh > sl:
                     fib = fibonacci_levels(sh, sl)
 
-            # 4. Build bracket
+            # 5. Build bracket
             bracket = self._order_manager.build_bracket(
                 ticker,
                 signal.score,
@@ -73,7 +77,7 @@ class Executor:
                 fib_levels=fib,
             )
 
-            # 5. Risk gate
+            # 6. Risk gate
             gate = gate_check(
                 ticker,
                 signal.direction,
@@ -86,7 +90,7 @@ class Executor:
                 log.debug("Gate rejected %s: %s", ticker, gate.reason)
                 return
 
-            # 6. Submit order
+            # 7. Submit order
             order = await self._broker.submit_bracket_order(
                 ticker,
                 bracket.qty,

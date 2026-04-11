@@ -15,6 +15,7 @@ SECTOR_MAP: dict[str, str] = {
     "TSLA": "consumer", "COIN": "crypto", "MSTR": "crypto",
     "PLTR": "tech", "SOFI": "finance", "ARKK": "etf",
     "SPY": "etf", "QQQ": "etf",
+    "BTC/USD": "crypto", "ETH/USD": "crypto",
 }
 
 

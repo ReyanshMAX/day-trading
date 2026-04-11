@@ -71,10 +71,8 @@ class ChromaStore:
             for i, doc_id in enumerate(results["ids"][0]):
                 meta = results["metadatas"][0][i]
                 formatted.append(
-                    f"Past example: {meta['ticker']} on {meta['date']} — "
-                    f"regime={meta['regime']}, conviction={meta['conviction']}\n"
-                    f"Catalyst: {meta.get('catalyst', '')}\n"
-                    f"Outcome: {meta['outcome']} ({meta['pnl_pct']:+.2f}%)"
+                    f"{meta['ticker']} {meta['date']}: {meta['regime']} cv={meta['conviction']}"
+                    f" | {meta.get('catalyst','')} | {meta['outcome']} ({meta['pnl_pct']:+.2f}%)"
                 )
             return formatted
         except Exception as e:

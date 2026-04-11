@@ -17,35 +17,16 @@ from signals.scoring import RegimeState
 
 log = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = (
-    "You are a market regime classifier for intraday trading. "
-    "Respond ONLY with valid JSON. No explanation, no markdown."
-)
+_SYSTEM_PROMPT = "Intraday regime classifier. Reply ONLY with valid JSON."
 
 _USER_TEMPLATE = """\
-Stock: {ticker}
-Current time: {time}
-Recent headlines (last 6 hours): {headlines}
+Ticker: {ticker}
+Time: {time}
 Prior regime: {prior_regime}
-
+Headlines: {headlines}
 {few_shot}
-
-Classify this stock for today's intraday trading session.
-
-Output exactly:
-{{
-  "regime": "trending" | "ranging" | "avoid",
-  "direction": "bullish" | "bearish" | "neutral",
-  "conviction": 1 | 2 | 3 | 4 | 5,
-  "catalyst": "<one sentence max>",
-  "avoid_reason": "<only if regime is avoid, else null>"
-}}
-
-Regime definitions:
-- trending: clear directional bias, likely to continue intraday
-- ranging: oscillating around a mean, no clear direction
-- avoid: earnings today/tomorrow, trading halt risk, very low liquidity, or major conflicting signals
-"""
+Respond with only this JSON object, no nesting:
+{{"regime":"trending|ranging|avoid","direction":"bullish|bearish|neutral","conviction":1-5,"catalyst":"brief phrase","avoid_reason":null}}"""
 
 
 def fallback_regime() -> RegimeState:
@@ -74,10 +55,11 @@ class RegimeClassifier:
         few_shot_examples = self._chroma.get_similar_contexts(ticker, headlines, n=2)
         few_shot_block = ""
         if few_shot_examples:
-            few_shot_block = "Historical context:\n" + "\n\n".join(few_shot_examples) + "\n"
+            few_shot_block = "Prior: " + " | ".join(few_shot_examples) + "\n"
 
         now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        headlines_str = "\n".join(f"- {h}" for h in headlines) if headlines else "No recent headlines."
+        top_headlines = headlines[:5]
+        headlines_str = "; ".join(top_headlines) if top_headlines else "none"
 
         user_msg = _USER_TEMPLATE.format(
             ticker=ticker,

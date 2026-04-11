@@ -22,21 +22,40 @@ from execution.executor import Executor
 log = logging.getLogger(__name__)
 
 
-async def close_all_positions_eod(broker, portfolio, config):
-    """Scheduled coroutine that closes all positions at 3:55 PM ET."""
-    while True:
-        now = datetime.now(tz=timezone("America/New_York"))
-        close_time = now.replace(hour=15, minute=55, second=0, microsecond=0)
-        if now >= close_time:
-            log.info("EOD: closing all positions")
-            for ticker, pos in list(portfolio.positions.items()):
-                side = "sell" if pos.side == "long" else "buy"
-                await broker.submit_market_order(ticker, pos.qty, side)
-            break
-        await asyncio.sleep(30)
+def _is_crypto(ticker: str) -> bool:
+    return "/" in ticker or (ticker.endswith("USD") and len(ticker) > 4)
 
 
-async def main():
+async def close_all_positions_eod(
+    broker: AlpacaBroker,
+    portfolio: Portfolio,
+    shutdown: asyncio.Event,
+) -> None:
+    """Sleeps until 3:55 PM ET, closes all equity positions, then sets the shutdown event."""
+    et = timezone("America/New_York")
+    now = datetime.now(tz=et)
+    close_time = now.replace(hour=15, minute=55, second=0, microsecond=0)
+
+    if now >= close_time:
+        # Started after today's close — schedule for tomorrow
+        from datetime import timedelta
+        close_time = close_time + timedelta(days=1)
+
+    wait_seconds = (close_time - now).total_seconds()
+    log.info("EOD close scheduled in %.0f seconds (at %s ET)", wait_seconds, close_time.strftime("%H:%M"))
+    await asyncio.sleep(wait_seconds)
+
+    log.info("EOD: closing equity positions")
+    for ticker, pos in list(portfolio.positions.items()):
+        if _is_crypto(ticker):
+            log.info("EOD: skipping crypto position %s (24/7 market)", ticker)
+            continue
+        side = "sell" if pos.side == "long" else "buy"
+        await broker.submit_market_order(ticker, pos.qty, side)
+    shutdown.set()
+
+
+async def main() -> None:
     configure_logging()
     config = load_config()
     log.info("System starting. NAV=%.0f tickers=%d", config.account.nav, len(config.universe.tickers))
@@ -67,13 +86,21 @@ async def main():
     order_manager = OrderManager(config)
     executor = Executor(broker, portfolio, signal_engine, order_manager, None, config)
 
+    shutdown = asyncio.Event()
+
     log.info("Starting stream and watchers...")
-    await asyncio.gather(
+    stream_task = asyncio.create_task(
         stream.start(config.universe.tickers, executor.on_tick,
-                     api_key=config.alpaca_api_key, secret_key=config.alpaca_secret_key),
-        news_watcher.watch(),
-        close_all_positions_eod(broker, portfolio, config),
+                     api_key=config.alpaca_api_key, secret_key=config.alpaca_secret_key)
     )
+    watch_task = asyncio.create_task(news_watcher.watch())
+    eod_task = asyncio.create_task(close_all_positions_eod(broker, portfolio, shutdown))
+
+    await shutdown.wait()
+    log.info("Shutdown event set — cancelling stream and news watcher.")
+    stream_task.cancel()
+    watch_task.cancel()
+    await asyncio.gather(stream_task, watch_task, eod_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

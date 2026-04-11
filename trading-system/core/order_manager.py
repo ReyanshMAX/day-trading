@@ -83,16 +83,20 @@ class OrderManager:
             raw_stop = entry + stop_dist
             raw_target = entry - target_dist
 
-        # Fibonacci snapping
+        # Fibonacci snapping — only apply if the snapped value preserves the direction invariant
         if fib_levels:
             retracements = list(fib_levels.get("retracements", {}).values())
             extensions = list(fib_levels.get("extensions", {}).values())
             if direction == "long":
-                raw_stop = snap_to_fib(raw_stop, retracements)
-                raw_target = snap_to_fib(raw_target, extensions)
+                snapped_stop = snap_to_fib(raw_stop, retracements)
+                snapped_target = snap_to_fib(raw_target, extensions)
+                raw_stop = snapped_stop if snapped_stop < entry else raw_stop
+                raw_target = snapped_target if snapped_target > entry else raw_target
             else:
-                raw_stop = snap_to_fib(raw_stop, extensions)
-                raw_target = snap_to_fib(raw_target, retracements)
+                snapped_stop = snap_to_fib(raw_stop, extensions)
+                snapped_target = snap_to_fib(raw_target, retracements)
+                raw_stop = snapped_stop if snapped_stop > entry else raw_stop
+                raw_target = snapped_target if snapped_target < entry else raw_target
 
         # Recompute actual stop distance after potential snap
         actual_stop_dist = abs(entry - raw_stop)
@@ -102,6 +106,17 @@ class OrderManager:
             self._config.risk.max_trade_risk_pct,
         )
         qty = max(1, int(base_qty * size_mult))
+
+        # Hard cap: notional value must not exceed max_position_pct of NAV.
+        # Without this, a tiny ATR-derived stop produces a massive share count.
+        max_notional = self._config.account.nav * self._config.risk.max_position_pct
+        max_qty_by_notional = max(1, math.floor(max_notional / entry))
+        if qty > max_qty_by_notional:
+            log.warning(
+                "%s qty capped by notional: %d -> %d (entry=%.2f max_notional=%.0f)",
+                ticker, qty, max_qty_by_notional, entry, max_notional,
+            )
+            qty = max_qty_by_notional
 
         # Validate bracket invariant
         if direction == "long":

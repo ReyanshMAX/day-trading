@@ -9,17 +9,24 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from alpaca.trading.client import TradingClient
+from alpaca.trading.models import Order
 from alpaca.trading.requests import MarketOrderRequest, OrderClass, StopLossRequest, TakeProfitRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data import DataFeed
 
 from core.config import Config
 
 log = logging.getLogger(__name__)
 
 _asset_cache: dict[str, bool] = {}
+
+
+def _is_crypto(ticker: str) -> bool:
+    """Return True if ticker is a crypto pair (e.g. BTC/USD, ETHUSD)."""
+    return "/" in ticker or ticker.endswith("USD") and len(ticker) > 4
 
 
 class AlpacaBroker:
@@ -32,6 +39,10 @@ class AlpacaBroker:
             paper=config.account.paper,
         )
         self._data = StockHistoricalDataClient(
+            api_key=config.alpaca_api_key,
+            secret_key=config.alpaca_secret_key,
+        )
+        self._crypto_data = CryptoHistoricalDataClient(
             api_key=config.alpaca_api_key,
             secret_key=config.alpaca_secret_key,
         )
@@ -59,21 +70,23 @@ class AlpacaBroker:
         self._trading.cancel_order_by_id(order_id)
         log.info("Cancelled order %s", order_id)
 
-    def submit_bracket_order(
+    async def submit_bracket_order(
         self,
         ticker: str,
         qty: int,
         side: str,
         stop_price: float,
         take_profit_price: float,
-    ):
+    ) -> Order:
         """Submit a bracket order (market entry with stop-loss and take-profit legs)."""
         alpaca_side = OrderSide.BUY if side == "long" else OrderSide.SELL
+        # Crypto only supports GTC; equities use DAY
+        tif = TimeInForce.GTC if _is_crypto(ticker) else TimeInForce.DAY
         request = MarketOrderRequest(
             symbol=ticker,
             qty=qty,
             side=alpaca_side,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=tif,
             order_class=OrderClass.BRACKET,
             stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
             take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
@@ -85,14 +98,15 @@ class AlpacaBroker:
         )
         return order
 
-    async def submit_market_order(self, ticker: str, qty: int, side: str):
+    async def submit_market_order(self, ticker: str, qty: int, side: str) -> None:
         """Submit a plain market order (used for EOD close-all)."""
         alpaca_side = OrderSide.SELL if side == "sell" else OrderSide.BUY
+        tif = TimeInForce.GTC if _is_crypto(ticker) else TimeInForce.DAY
         request = MarketOrderRequest(
             symbol=ticker,
             qty=qty,
             side=alpaca_side,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=tif,
         )
         order = self._trading.submit_order(request)
         log.info("Market order submitted: %s %s qty=%d", ticker, side, qty)
@@ -109,30 +123,35 @@ class AlpacaBroker:
         tf = tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Minute))
 
         end = datetime.now(tz=timezone.utc)
-        # Fetch extra to account for non-trading periods
-        start = end - timedelta(minutes=limit * 3)
+        # Crypto trades 24/7 so 1.5x is enough; equities need 3x to skip non-trading gaps
+        multiplier = 2 if _is_crypto(ticker) else 3
+        start = end - timedelta(minutes=limit * multiplier)
 
-        request = StockBarsRequest(
-            symbol_or_symbols=ticker,
-            timeframe=tf,
-            start=start,
-            end=end,
-            limit=limit,
-        )
-        bars = self._data.get_stock_bars(request)
+        if _is_crypto(ticker):
+            request = CryptoBarsRequest(
+                symbol_or_symbols=ticker,
+                timeframe=tf,
+                start=start,
+                end=end,
+                limit=limit,
+            )
+            bars = self._crypto_data.get_crypto_bars(request)
+        else:
+            request = StockBarsRequest(
+                symbol_or_symbols=ticker,
+                timeframe=tf,
+                start=start,
+                end=end,
+                limit=limit,
+                feed=DataFeed.IEX,
+            )
+            bars = self._data.get_stock_bars(request)
+
         df = bars.df
 
         if isinstance(df.index, pd.MultiIndex):
             df = df.xs(ticker, level="symbol")
 
-        df = df.rename(columns={
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "volume": "volume",
-            "vwap": "vwap",
-        })
         df = df[["open", "high", "low", "close", "volume"]].copy()
         df.index = pd.to_datetime(df.index, utc=True)
         df = df.tail(limit)
@@ -146,7 +165,7 @@ class AlpacaBroker:
             return _asset_cache[ticker]
         try:
             asset = self._trading.get_asset(ticker)
-            result = bool(asset.tradable) and asset.status.value == "active"
+            result = bool(asset.tradable) and str(asset.status).lower() in ("active", "assetstatus.active")
         except Exception as e:
             log.warning("Could not check tradability for %s: %s", ticker, e)
             result = False
