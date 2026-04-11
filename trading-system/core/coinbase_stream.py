@@ -27,8 +27,6 @@ _SYMBOL_TO_PRODUCT: dict[str, str] = {
     "BTC/USD": "BTC-USD",
     "ETH/USD": "ETH-USD",
     "SOL/USD": "SOL-USD",
-    "AVAX/USD": "AVAX-USD",
-    "DOGE/USD": "DOGE-USD",
 }
 
 # Reverse: Coinbase product ID → config symbol
