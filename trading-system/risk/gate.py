@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 class GateResult:
     approved: bool
     reason: str | None
+    set_loss_limit: bool = False
 
 
 def check(
@@ -27,10 +28,14 @@ def check(
     portfolio: Portfolio,
     config: Config,
 ) -> GateResult:
-    """Run all five risk checks in order. Returns GateResult."""
+    """Run all five risk checks in order. Returns GateResult.
+
+    Pure function — no side effects. If the daily loss limit is newly breached,
+    set_loss_limit=True is returned so the caller can apply the mutation.
+    """
     import datetime
 
-    now = datetime.datetime.now().isoformat()
+    now = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
 
     # 1. Daily loss limit flag already set
     if portfolio.daily_loss_limit_hit:
@@ -39,12 +44,11 @@ def check(
 
     # 2. Daily P&L crosses -3% threshold
     if portfolio.daily_pnl_pct() < -config.risk.daily_loss_limit_pct:
-        portfolio.daily_loss_limit_hit = True
         log.warning(
             "%s | %s | REJECT: daily pnl %.2f%% crossed limit -%.0f%%",
             now, ticker, portfolio.daily_pnl_pct() * 100, config.risk.daily_loss_limit_pct * 100,
         )
-        return GateResult(approved=False, reason="daily loss limit")
+        return GateResult(approved=False, reason="daily loss limit", set_loss_limit=True)
 
     # 3. Portfolio heat
     if portfolio.open_risk_pct() >= config.risk.max_portfolio_heat_pct:

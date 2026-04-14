@@ -24,6 +24,12 @@ class IndicatorSnapshot:
     orb_low: float | None
     atr: float
     vwap_std: float = 0.0  # standard deviation of (typical_price - vwap)
+    # Mean-reversion band re-entry flags (long side)
+    prev_close_below_lower_band: bool = False   # prev bar closed below -2.0 VWAP band
+    current_close_above_lower_band: bool = False  # current bar close is above -2.0 VWAP band
+    # Mean-reversion band re-entry flags (short side)
+    prev_close_above_upper_band: bool = False   # prev bar closed above +2.0 VWAP band
+    current_close_below_upper_band: bool = False  # current bar close is back below +2.0 VWAP band
 
 
 @dataclass
@@ -35,46 +41,76 @@ class RegimeState:
     avoid_reason: str | None = None
 
 
-def compute_score(indicators: IndicatorSnapshot, regime: RegimeState) -> float | None:
+def compute_score(
+    indicators: IndicatorSnapshot,
+    regime: RegimeState,
+    confidence: float = 1.0,
+) -> float | None:
     """Compute composite signal score. Returns None for avoid regime."""
     if regime.regime == "avoid":
+        log.debug("compute_score: avoid regime, returning None (confidence=%.2f)", confidence)
         return None
 
     if regime.regime == "trending":
-        return _score_trending(indicators, regime)
+        score = _score_trending(indicators, regime)
     elif regime.regime == "ranging":
-        return _score_ranging(indicators, regime)
+        score = _score_ranging(indicators, regime)
     else:
         log.warning("Unknown regime '%s', returning 0.0", regime.regime)
+        score = 0.0
+
+    log.debug(
+        "compute_score: regime=%s direction=%s score=%.4f confidence=%.2f",
+        regime.regime,
+        regime.direction,
+        score,
+        confidence,
+    )
+    return score
+
+
+def _weighted_sum(pairs: list[tuple[float, float | None]]) -> float:
+    """Compute a normalized weighted sum, excluding None-valued components.
+
+    Args:
+        pairs: list of (weight, value) where value is 0.0/1.0 or None.
+               None means the component is unavailable and its weight is
+               redistributed proportionally across remaining components.
+
+    Returns:
+        Weighted average over non-None components, in [0.0, 1.0].
+        Returns 0.0 if all components are None.
+    """
+    active = [(w, v) for w, v in pairs if v is not None]
+    if not active:
         return 0.0
+    total_weight = sum(w for w, _ in active)
+    if total_weight <= 0.0:
+        return 0.0
+    return sum(w * v for w, v in active) / total_weight
 
 
 def _score_trending(indicators: IndicatorSnapshot, regime: RegimeState) -> float:
-    """Trending regime scoring. Positive = long bias, negative = short bias."""
-    weights: list[tuple[float, bool]] = []
+    """Trending regime scoring. Positive = long bias, negative = short bias.
 
-    # EMA crossover
-    weights.append((0.25, indicators.ema_fast > indicators.ema_slow))
-    # Price vs VWAP
-    weights.append((0.20, indicators.current_price > indicators.vwap))
-    # ORB breakout — only include when available
+    Weights (sum to 1.0 when all present):
+        ema_trend=0.25, vwap_pos=0.20, orb=0.15, macd=0.15, rsi=0.10, rvol=0.15
+    """
+    # ORB is None when pre-market or window not elapsed — excluded from sum.
+    orb_value: float | None = None
     if indicators.orb_high is not None:
-        weights.append((0.15, indicators.current_price > indicators.orb_high))
-        total_weight = 1.0
-    else:
-        total_weight = 0.85  # redistribute ORB weight proportionally
-    # Volume confirmation
-    weights.append((0.15, indicators.rvol > 1.5))
-    # RSI momentum
-    weights.append((0.10, 40 < indicators.rsi < 70))
-    # MACD confirmation
-    weights.append((0.15, indicators.macd_line > indicators.macd_signal))
+        orb_value = 1.0 if indicators.current_price > indicators.orb_high else 0.0
 
-    raw_score = sum(w for w, cond in weights if cond)
+    pairs: list[tuple[float, float | None]] = [
+        (0.25, 1.0 if indicators.ema_fast > indicators.ema_slow else 0.0),
+        (0.20, 1.0 if indicators.current_price > indicators.vwap else 0.0),
+        (0.15, orb_value),
+        (0.15, 1.0 if indicators.macd_line > indicators.macd_signal else 0.0),
+        (0.10, 1.0 if 40 < indicators.rsi < 70 else 0.0),
+        (0.15, 1.0 if indicators.rvol > 1.5 else 0.0),
+    ]
 
-    # Renormalize if ORB was excluded
-    if indicators.orb_high is None:
-        raw_score = raw_score / total_weight
+    raw_score = _weighted_sum(pairs)
 
     # Apply direction: regime says bearish → negate
     if regime.direction == "bearish":
@@ -84,41 +120,85 @@ def _score_trending(indicators: IndicatorSnapshot, regime: RegimeState) -> float
 
 
 def _score_ranging(indicators: IndicatorSnapshot, regime: RegimeState) -> float:
-    """Ranging regime scoring — mean reversion bias."""
-    score = 0.0
-    total_w = 0.0
+    """Ranging regime scoring — mean reversion bias.
 
-    # Price below VWAP - 1 std (mean reversion long)
-    if indicators.vwap_std > 0:
-        lower_band = indicators.vwap - 1.0 * indicators.vwap_std
-        if indicators.current_price < lower_band:
-            score += 0.35
-    total_w += 0.35
+    Bullish/neutral: score long-bias conditions (oversold).
+    Bearish: score short-bias conditions (overbought) and return as negative.
 
-    # RSI oversold
-    if indicators.rsi < 35:
-        score += 0.25
-    total_w += 0.25
-
-    # Volume confirmation
-    if indicators.rvol > 1.2:
-        score += 0.20
-    total_w += 0.20
-
-    # Near ORB support
-    orb_weight = 0.20
-    if indicators.orb_low is not None:
-        near_support = abs(indicators.current_price - indicators.orb_low) / indicators.current_price < 0.005
-        if near_support:
-            score += orb_weight
-        total_w += orb_weight
-
-    if total_w > 0:
-        score = score / total_w
-    else:
-        score = 0.0
-
+    Weights (sum to 1.0 when all present):
+        vwap_band=0.35, rsi=0.25, orb_proximity=0.20, rvol=0.20
+    """
     if regime.direction == "bearish":
-        score = -score
+        raw_score = _score_ranging_short(indicators)
+        return max(-1.0, min(1.0, -raw_score))
+    else:
+        raw_score = _score_ranging_long(indicators)
+        return max(-1.0, min(1.0, raw_score))
 
-    return max(-1.0, min(1.0, score))
+
+def _score_ranging_long(indicators: IndicatorSnapshot) -> float:
+    """Long-bias ranging score (mean reversion from oversold).
+
+    VWAP band component fires only when price has re-entered the -2.0 band:
+    previous bar was below the -2.0 band AND current bar is above it.
+    """
+    # vwap_band: None when vwap_std is unavailable (zero → no std computed yet)
+    # Use the -2.0 standard deviation band (not -1.0) as the trigger threshold.
+    # Additionally require band re-entry confirmation: prev bar below, current bar above.
+    vwap_band_value: float | None = None
+    if indicators.vwap_std > 0:
+        if indicators.prev_close_below_lower_band and indicators.current_close_above_lower_band:
+            vwap_band_value = 1.0
+        else:
+            vwap_band_value = None  # no contribution when re-entry not confirmed
+
+    # orb_proximity: None when ORB not yet established
+    orb_prox_value: float | None = None
+    if indicators.orb_low is not None:
+        near_support = (
+            abs(indicators.current_price - indicators.orb_low) / indicators.current_price < 0.005
+        )
+        orb_prox_value = 1.0 if near_support else 0.0
+
+    pairs: list[tuple[float, float | None]] = [
+        (0.35, vwap_band_value),
+        (0.25, 1.0 if indicators.rsi < 35 else 0.0),
+        (0.20, orb_prox_value),
+        (0.20, 1.0 if indicators.rvol > 1.2 else 0.0),
+    ]
+
+    return _weighted_sum(pairs)
+
+
+def _score_ranging_short(indicators: IndicatorSnapshot) -> float:
+    """Short-bias ranging score (mean reversion from overbought).
+
+    VWAP band component fires only when price has re-entered the +2.0 band:
+    previous bar was above the +2.0 band AND current bar is back below it.
+    """
+    # vwap_band: None when vwap_std is unavailable
+    # Use the +2.0 standard deviation band (not +1.0) as the trigger threshold.
+    # Additionally require band re-entry confirmation: prev bar above, current bar below.
+    vwap_band_value: float | None = None
+    if indicators.vwap_std > 0:
+        if indicators.prev_close_above_upper_band and indicators.current_close_below_upper_band:
+            vwap_band_value = 1.0
+        else:
+            vwap_band_value = None  # no contribution when re-entry not confirmed
+
+    # orb_proximity: None when ORB not yet established
+    orb_prox_value: float | None = None
+    if indicators.orb_high is not None:
+        near_resistance = (
+            abs(indicators.current_price - indicators.orb_high) / indicators.current_price < 0.005
+        )
+        orb_prox_value = 1.0 if near_resistance else 0.0
+
+    pairs: list[tuple[float, float | None]] = [
+        (0.35, vwap_band_value),
+        (0.25, 1.0 if indicators.rsi > 65 else 0.0),
+        (0.20, orb_prox_value),
+        (0.20, 1.0 if indicators.rvol > 1.2 else 0.0),
+    ]
+
+    return _weighted_sum(pairs)

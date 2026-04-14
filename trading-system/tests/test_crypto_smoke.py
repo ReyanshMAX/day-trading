@@ -19,6 +19,7 @@ from signals.scoring import RegimeState
 from regime.regime_store import RegimeStore
 from core.portfolio import Portfolio
 from core.order_manager import OrderManager
+from risk.gate import check as gate_check
 
 TICKER = "BTC/USD"
 
@@ -140,7 +141,7 @@ def make_executor(bars: pd.DataFrame, regime: RegimeState):
     broker.is_tradable = AsyncMock(return_value=True)
     broker.submit_bracket_order = AsyncMock(return_value=mock_order)
 
-    executor = Executor(broker, portfolio, signal_engine, order_manager, None, config)
+    executor = Executor(broker, portfolio, signal_engine, order_manager, gate_check, config)
     return executor, broker
 
 

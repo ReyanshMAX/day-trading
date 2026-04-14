@@ -33,6 +33,7 @@ class RiskConfig:
     max_portfolio_heat_pct: float
     max_sector_positions: int
     daily_loss_limit_pct: float
+    max_position_duration_minutes: int
 
 
 @dataclass
@@ -53,6 +54,11 @@ class RegimeConfig:
 
 
 @dataclass
+class LlmConfig:
+    groq_model: str
+
+
+@dataclass
 class RRProfile:
     stop_atr_mult: float
     target_atr_mult: float
@@ -66,6 +72,7 @@ class Config:
     risk: RiskConfig
     signal: SignalConfig
     regime: RegimeConfig
+    llm: LlmConfig
     rr_profiles: dict[str, RRProfile]
 
     # Env-loaded secrets
@@ -128,6 +135,7 @@ def load_config(config_path: str | None = None) -> Config:
             max_portfolio_heat_pct=float(raw["risk"]["max_portfolio_heat_pct"]),
             max_sector_positions=int(raw["risk"]["max_sector_positions"]),
             daily_loss_limit_pct=float(raw["risk"]["daily_loss_limit_pct"]),
+            max_position_duration_minutes=int(raw["risk"]["max_position_duration_minutes"]),
         ),
         signal=SignalConfig(
             entry_threshold=float(raw["signal"]["entry_threshold"]),
@@ -141,6 +149,9 @@ def load_config(config_path: str | None = None) -> Config:
         regime=RegimeConfig(
             news_poll_interval_seconds=int(raw["regime"]["news_poll_interval_seconds"]),
             min_conviction_to_trade=int(raw["regime"]["min_conviction_to_trade"]),
+        ),
+        llm=LlmConfig(
+            groq_model=str(raw["llm"]["groq_model"]),
         ),
         rr_profiles=rr_profiles,
         alpaca_api_key=alpaca_api_key,

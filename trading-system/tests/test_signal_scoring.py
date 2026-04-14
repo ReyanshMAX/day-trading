@@ -50,11 +50,13 @@ def test_perfect_trending_long_score_above_threshold():
 
 
 def test_ranging_oversold_score_above_threshold():
+    # Price has re-entered from below the -2.0 band: prev bar was below, current is above.
+    # vwap=100, std=1.0 → -2.0 band = 98.0; current_price=98.5 is above it.
     snap = IndicatorSnapshot(
         ema_fast=100.0,
         ema_slow=101.0,
         vwap=100.0,
-        current_price=98.5,  # below vwap - 1*std (std=1.0 → lower=99.0)
+        current_price=98.5,  # above -2.0 band (98.0), having re-entered from below
         rsi=30.0,
         macd_line=0.0,
         macd_signal=0.1,
@@ -63,6 +65,8 @@ def test_ranging_oversold_score_above_threshold():
         orb_low=98.6,  # near support
         atr=1.0,
         vwap_std=1.0,
+        prev_close_below_lower_band=True,   # prev bar was below -2.0 band
+        current_close_above_lower_band=True,  # current bar re-entered above -2.0 band
     )
     regime = RegimeState(regime="ranging", conviction=3, direction="bullish")
     score = compute_score(snap, regime)
@@ -93,3 +97,55 @@ def test_no_orb_still_returns_valid_score():
     score = compute_score(snap, regime)
     assert score is not None
     assert -1.0 <= score <= 1.0
+
+
+def test_ranging_bearish_uses_short_bias_conditions():
+    """Bearish ranging regime should score short-bias (overbought) conditions, not negate long."""
+    # Price has re-entered from above the +2.0 band: prev bar was above, current is below.
+    # vwap=100, std=1.0 → +2.0 band = 102.0; current_price=101.6 is below it.
+    snap = IndicatorSnapshot(
+        ema_fast=100.0,
+        ema_slow=101.0,
+        vwap=100.0,
+        current_price=101.6,  # below +2.0 band (102.0), having re-entered from above
+        rsi=70.0,             # overbought
+        macd_line=0.0,
+        macd_signal=0.0,
+        rvol=1.5,
+        orb_high=101.5,       # near resistance (within 0.5%)
+        orb_low=98.0,
+        atr=1.0,
+        vwap_std=1.0,
+        prev_close_above_upper_band=True,    # prev bar was above +2.0 band
+        current_close_below_upper_band=True,  # current bar re-entered below +2.0 band
+    )
+    regime = RegimeState(regime="ranging", conviction=3, direction="bearish")
+    score = compute_score(snap, regime)
+    assert score is not None
+    # Bearish ranging with overbought conditions → strong negative score
+    assert score < -0.5
+
+
+def test_ranging_bearish_oversold_not_high_score():
+    """Oversold conditions should NOT produce a strong bearish ranging score."""
+    # Oversold setup — good for long ranging, NOT for bearish ranging
+    snap = IndicatorSnapshot(
+        ema_fast=100.0,
+        ema_slow=101.0,
+        vwap=100.0,
+        current_price=98.5,  # below VWAP lower band
+        rsi=30.0,            # oversold — should NOT score high in bearish mode
+        macd_line=0.0,
+        macd_signal=0.0,
+        rvol=1.5,
+        orb_high=102.0,
+        orb_low=98.6,
+        atr=1.0,
+        vwap_std=1.0,
+    )
+    regime = RegimeState(regime="ranging", conviction=3, direction="bearish")
+    score = compute_score(snap, regime)
+    assert score is not None
+    # Oversold conditions with bearish direction: short scorer finds no overbought → near zero negative
+    # (only rvol contributes, so score should be low magnitude)
+    assert score > -0.5

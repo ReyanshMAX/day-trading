@@ -29,7 +29,14 @@ Respond with only this JSON object, no nesting:
 {{"regime":"trending|ranging|avoid","direction":"bullish|bearish|neutral","conviction":1-5,"catalyst":"brief phrase","avoid_reason":null}}"""
 
 
-def fallback_regime() -> RegimeState:
+def fallback_regime(prior_regime: "RegimeState | None" = None) -> RegimeState:
+    if prior_regime is not None:
+        return RegimeState(
+            regime=prior_regime.regime,
+            conviction=max(1, prior_regime.conviction - 1),
+            direction=prior_regime.direction,
+            catalyst="classifier error",
+        )
     return RegimeState(
         regime="ranging",
         conviction=2,
@@ -44,6 +51,7 @@ class RegimeClassifier:
     def __init__(self, config: Config, chroma: ChromaStore) -> None:
         self._client = AsyncGroq(api_key=config.groq_api_key)
         self._chroma = chroma
+        self._groq_model = config.llm.groq_model
 
     async def classify(
         self,
@@ -70,9 +78,10 @@ class RegimeClassifier:
         )
 
         raw = ""
+        state: RegimeState | None = None
         try:
             response = await self._client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=self._groq_model,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
@@ -98,8 +107,6 @@ class RegimeClassifier:
                 catalyst=str(data.get("catalyst", "")),
                 avoid_reason=data.get("avoid_reason"),
             )
-            self._chroma.store_classification(ticker, state, headlines)
-            return state
 
         except (json.JSONDecodeError, KeyError, AssertionError) as e:
             log.error("Classifier JSON invalid for %s: %s | raw: %s", ticker, e, raw)
@@ -107,3 +114,10 @@ class RegimeClassifier:
         except Exception as e:
             log.error("Classifier error for %s: %s", ticker, e)
             return fallback_regime()
+
+        try:
+            self._chroma.store_classification(ticker, state, headlines)
+        except Exception as e:
+            log.error("ChromaDB store failed for %s: %s", ticker, e)
+
+        return state

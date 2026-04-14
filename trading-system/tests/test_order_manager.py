@@ -6,7 +6,8 @@ Offline — no broker calls.
 import pytest
 from core.order_manager import OrderManager, snap_to_fib, compute_base_size, BracketParams
 from core.config import (
-    Config, UniverseConfig, AccountConfig, RiskConfig, SignalConfig, RegimeConfig, RRProfile
+    Config, UniverseConfig, AccountConfig, RiskConfig, SignalConfig, RegimeConfig, RRProfile,
+    LlmConfig,
 )
 
 
@@ -26,6 +27,7 @@ def make_config() -> Config:
             vwap_deviation_bands=[1.0, 2.0, 2.5], orb_window_minutes=15,
         ),
         regime=RegimeConfig(news_poll_interval_seconds=120, min_conviction_to_trade=3),
+        llm=LlmConfig(groq_model="llama-3.3-70b-versatile"),
         rr_profiles={
             "trending": RRProfile(1.5, 3.0, {1: 0.25, 2: 0.5, 3: 0.75, 4: 1.0, 5: 1.25}),
             "ranging": RRProfile(1.0, 1.5, {1: 0.0, 2: 0.25, 3: 0.5, 4: 0.75, 5: 1.0}),
@@ -83,3 +85,28 @@ def test_bracket_with_fib_levels_does_not_violate_invariant():
     om = OrderManager(make_config())
     params = om.build_bracket("NVDA", 0.8, "trending", 4, atr=5.0, current_price=910.0, fib_levels=fib)
     assert params.stop < 910.0 < params.target
+
+
+def test_ranging_conviction_one_raises_value_error():
+    """size_multiplier=0.0 for ranging+conviction=1 must raise ValueError, not place a 1-share order."""
+    om = OrderManager(make_config())
+    with pytest.raises(ValueError, match="size_multiplier is 0.0"):
+        om.build_bracket("NVDA", 0.8, "ranging", 1, atr=2.0, current_price=100.0)
+
+
+def test_nav_parameter_overrides_config_nav():
+    """Live NAV passed explicitly should be used instead of config static value."""
+    om = OrderManager(make_config())
+    # With nav=50_000 (half of config's 100_000), risk_dollars halves, so qty should be smaller or equal.
+    params_default = om.build_bracket("NVDA", 0.8, "trending", 4, atr=2.0, current_price=100.0)
+    params_half_nav = om.build_bracket("NVDA", 0.8, "trending", 4, atr=2.0, current_price=100.0, nav=50_000.0)
+    # Half NAV -> half risk dollars -> fewer shares (or same if already at floor=1)
+    assert params_half_nav.qty <= params_default.qty
+
+
+def test_nav_parameter_larger_nav_increases_qty():
+    """Doubling NAV via parameter should increase qty relative to config NAV."""
+    om = OrderManager(make_config())
+    params_default = om.build_bracket("NVDA", 0.8, "trending", 4, atr=2.0, current_price=100.0)
+    params_double_nav = om.build_bracket("NVDA", 0.8, "trending", 4, atr=2.0, current_price=100.0, nav=200_000.0)
+    assert params_double_nav.qty >= params_default.qty

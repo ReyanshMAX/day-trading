@@ -29,6 +29,7 @@ risk:
   max_portfolio_heat_pct: 0.06
   max_sector_positions: 5
   daily_loss_limit_pct: 0.03
+  max_position_duration_minutes: 90
 
 signal:
   entry_threshold: 0.25
@@ -42,6 +43,9 @@ signal:
 regime:
   news_poll_interval_seconds: 120
   min_conviction_to_trade: 3
+
+llm:
+  groq_model: "llama-3.1-8b-instant"
 
 rr_profiles:
   trending:

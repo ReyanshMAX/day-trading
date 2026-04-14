@@ -6,7 +6,8 @@ All offline. Tests every rejection scenario explicitly.
 import pytest
 from core.portfolio import Portfolio, Position
 from core.config import (
-    Config, UniverseConfig, AccountConfig, RiskConfig, SignalConfig, RegimeConfig, RRProfile
+    Config, UniverseConfig, AccountConfig, RiskConfig, SignalConfig, RegimeConfig, RRProfile,
+    LlmConfig,
 )
 from risk.gate import check, GateResult
 
@@ -27,6 +28,7 @@ def make_config(nav: float = 100_000.0) -> Config:
             vwap_deviation_bands=[1.0, 2.0, 2.5], orb_window_minutes=15,
         ),
         regime=RegimeConfig(news_poll_interval_seconds=120, min_conviction_to_trade=3),
+        llm=LlmConfig(groq_model="llama-3.3-70b-versatile"),
         rr_profiles={
             "trending": RRProfile(1.5, 3.0, {1: 0.25, 2: 0.5, 3: 0.75, 4: 1.0, 5: 1.25}),
             "ranging": RRProfile(1.0, 1.5, {1: 0.0, 2: 0.25, 3: 0.5, 4: 0.75, 5: 1.0}),
@@ -64,7 +66,9 @@ def test_reject_and_set_flag_when_pnl_below_threshold():
     result = check("NVDA", "long", 10, 1.0, portfolio, make_config())
     assert not result.approved
     assert result.reason == "daily loss limit"
-    assert portfolio.daily_loss_limit_hit  # flag must be set
+    # Gate is pure — it must NOT mutate portfolio; instead it signals via set_loss_limit
+    assert not portfolio.daily_loss_limit_hit
+    assert result.set_loss_limit is True
 
 
 def test_reject_portfolio_heat():

@@ -74,8 +74,12 @@ class BarStore:
         return df
 
     def backfill(self, ticker: str, df: pd.DataFrame) -> None:
-        """Load historical bars from broker.get_bars() into the deque."""
+        """Load historical bars from broker.get_bars() into the deque.
+
+        Clears any existing bars before loading to prevent duplicates on reconnect.
+        """
         self._ensure_ticker(ticker)
+        self._bars[ticker].clear()
         for ts, row in df.iterrows():
             bar: Bar = {
                 "open": float(row["open"]),

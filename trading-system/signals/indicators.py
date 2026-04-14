@@ -12,31 +12,65 @@ import pandas_ta as ta
 
 log = logging.getLogger(__name__)
 
+_REQUIRED_OHLCV = {"open", "high", "low", "close", "volume"}
+_REQUIRED_CLOSE = {"close"}
+_REQUIRED_HLC = {"high", "low", "close"}
 
-def ema(df: pd.DataFrame, period: int) -> pd.Series:
+
+def _validate(df: pd.DataFrame, required_cols: set[str], min_rows: int, fn_name: str) -> bool:
+    """Return True if df passes validation. Log warning and return False otherwise."""
+    if not isinstance(df.index, pd.DatetimeIndex):
+        log.warning("%s: index must be DatetimeIndex, got %s", fn_name, type(df.index).__name__)
+        return False
+    missing = required_cols - set(df.columns)
+    if missing:
+        log.warning("%s: missing columns %s", fn_name, missing)
+        return False
+    if len(df) < min_rows:
+        log.warning("%s: need >= %d rows, got %d", fn_name, min_rows, len(df))
+        return False
+    return True
+
+
+def ema(df: pd.DataFrame, period: int) -> pd.Series | None:
     """Exponential moving average of close prices."""
+    if not _validate(df, _REQUIRED_CLOSE, period, "ema"):
+        return None
     return df["close"].ewm(span=period, adjust=False).mean()
 
 
-def vwap(df: pd.DataFrame) -> pd.Series:
-    """Session VWAP — resets daily, only uses bars from the current date."""
+def vwap(df: pd.DataFrame) -> pd.Series | None:
+    """Session VWAP — resets daily, only uses bars from the current date.
+
+    Returns NaN for bars outside today's session to prevent prior-session bleed.
+    """
+    if not _validate(df, _REQUIRED_OHLCV, 1, "vwap"):
+        return None
     last_date = df.index[-1].date()
     session = df[df.index.date == last_date].copy()
+    if session.empty:
+        log.warning("vwap: no bars for session date %s", last_date)
+        return None
     typical = (session["high"] + session["low"] + session["close"]) / 3
     cum_tp_vol = (typical * session["volume"]).cumsum()
     cum_vol = session["volume"].cumsum()
     vwap_series = cum_tp_vol / cum_vol
-    # Reindex back to full df length, forward-filling session values
-    return vwap_series.reindex(df.index, method="ffill")
+    # Reindex to full df index; bars outside today's session get NaN (no ffill)
+    return vwap_series.reindex(df.index)
 
 
-def vwap_bands(df: pd.DataFrame, deviations: list[float]) -> dict[str, pd.Series]:
+def vwap_bands(df: pd.DataFrame, deviations: list[float]) -> dict[str, pd.Series] | None:
     """VWAP ± N standard-deviation bands.
 
     Returns dict keyed by "+1.0", "-1.0", "+2.0" etc.
     """
+    if not _validate(df, _REQUIRED_OHLCV, 1, "vwap_bands"):
+        return None
     last_date = df.index[-1].date()
     session = df[df.index.date == last_date].copy()
+    if session.empty:
+        log.warning("vwap_bands: no bars for session date %s", last_date)
+        return None
     typical = (session["high"] + session["low"] + session["close"]) / 3
     cum_tp_vol = (typical * session["volume"]).cumsum()
     cum_vol = session["volume"].cumsum()
@@ -56,37 +90,62 @@ def vwap_bands(df: pd.DataFrame, deviations: list[float]) -> dict[str, pd.Series
     return result
 
 
-def atr(df: pd.DataFrame, period: int = 14) -> float:
+def atr(df: pd.DataFrame, period: int = 14) -> float | None:
     """Average True Range — returns current scalar value."""
+    # ATR needs period + 1 rows for a meaningful result
+    if not _validate(df, _REQUIRED_HLC, period + 1, "atr"):
+        return None
     result = ta.atr(df["high"], df["low"], df["close"], length=period)
     if result is None or result.dropna().empty:
-        return float("nan")
-    return float(result.iloc[-1])
+        return None
+    val = float(result.iloc[-1])
+    if np.isnan(val):
+        return None
+    return val
 
 
-def rsi(df: pd.DataFrame, period: int = 14) -> float:
+def rsi(df: pd.DataFrame, period: int = 14) -> float | None:
     """RSI — returns current scalar value."""
+    # RSI needs period + 1 rows minimum
+    if not _validate(df, _REQUIRED_CLOSE, period + 1, "rsi"):
+        return None
     result = ta.rsi(df["close"], length=period)
     if result is None or result.dropna().empty:
-        return float("nan")
-    return float(result.iloc[-1])
+        return None
+    val = float(result.iloc[-1])
+    if np.isnan(val):
+        return None
+    return val
 
 
-def macd(df: pd.DataFrame) -> tuple[float, float, float]:
+def macd(df: pd.DataFrame) -> tuple[float, float, float] | tuple[None, None, None]:
     """MACD — returns (macd_line, signal_line, histogram) as scalars."""
+    # MACD default: fast=12, slow=26, signal=9 → need at least 26+9=35 rows
+    if not _validate(df, _REQUIRED_CLOSE, 35, "macd"):
+        return None, None, None
     result = ta.macd(df["close"])
     if result is None or result.dropna().empty:
-        return float("nan"), float("nan"), float("nan")
+        return None, None, None
     row = result.iloc[-1]
     cols = result.columns.tolist()
-    return float(row[cols[0]]), float(row[cols[1]]), float(row[cols[2]])
+    macd_col = next((c for c in cols if c.startswith("MACD_")), None)
+    hist_col = next((c for c in cols if c.startswith("MACDh_")), None)
+    signal_col = next((c for c in cols if c.startswith("MACDs_")), None)
+    if macd_col is None or hist_col is None or signal_col is None:
+        return None, None, None
+    mv, sv, hv = float(row[macd_col]), float(row[signal_col]), float(row[hist_col])
+    if any(np.isnan(x) for x in (mv, sv, hv)):
+        return None, None, None
+    return mv, sv, hv
 
 
-def obv(df: pd.DataFrame) -> pd.Series:
+def obv(df: pd.DataFrame) -> pd.Series | None:
     """On-Balance Volume."""
+    if not _validate(df, {"close", "volume"}, 1, "obv"):
+        return None
     result = ta.obv(df["close"], df["volume"])
     if result is None:
-        return pd.Series(dtype=float)
+        return None
     return result
 
 
@@ -94,6 +153,7 @@ def rvol(df: pd.DataFrame, lookback: int = 20) -> float:
     """Relative volume: current bar volume vs average volume at this time of day.
 
     Approximated as last bar volume / mean of last `lookback` bar volumes.
+    Always returns a float (defaults to 1.0 on degenerate input).
     """
     if len(df) < 2:
         return 1.0
@@ -107,33 +167,42 @@ def rvol(df: pd.DataFrame, lookback: int = 20) -> float:
 def orb(df: pd.DataFrame, window_minutes: int = 15) -> tuple[float | None, float | None]:
     """Opening Range Breakout levels from the first N minutes after 9:30 AM ET.
 
-    Returns (orb_high, orb_low) or (None, None) if window not yet closed.
+    Returns (orb_high, orb_low) or (None, None) if the ORB window has not
+    yet closed, or if input is invalid. Uses vectorized boolean indexing.
     """
+    if not _validate(df, {"high", "low"}, 1, "orb"):
+        return None, None
+
     from datetime import time as dtime, timedelta, datetime as _dt
     import pytz
 
     try:
         et = pytz.timezone("America/New_York")
-        idx = df.index
-        last_date = idx[-1].astimezone(et).date()
+        idx_et = df.index.tz_convert(et)
+        last_date = idx_et[-1].date()
 
         open_time = dtime(9, 30)
         base = _dt(2000, 1, 1, 9, 30)
         close_time = (base + timedelta(minutes=window_minutes)).time()
 
-        orb_bars = []
-        for ts, row in df.iterrows():
-            ts_et = ts.astimezone(et)
-            if ts_et.date() != last_date:
-                continue
-            t = ts_et.time()
-            if open_time <= t < close_time:
-                orb_bars.append(row)
-
-        if len(orb_bars) < window_minutes:
+        # Check whether the ORB window has actually closed for the last bar
+        last_time_et = idx_et[-1].time()
+        if last_time_et < close_time:
             return None, None
 
-        orb_df = pd.DataFrame(orb_bars)
+        # Vectorized filter: same date and within [9:30, 9:30+window).
+        # Convert index to minute-of-day integers to avoid a Python-level loop.
+        same_day = idx_et.date == last_date
+        open_min = open_time.hour * 60 + open_time.minute          # 570
+        close_min = close_time.hour * 60 + close_time.minute       # 570 + window
+        idx_minutes = idx_et.hour * 60 + idx_et.minute             # vectorized numpy op
+        in_window = (idx_minutes >= open_min) & (idx_minutes < close_min)
+        mask = same_day & in_window
+
+        orb_df = df[mask]
+        if orb_df.empty:
+            return None, None
+
         return float(orb_df["high"].max()), float(orb_df["low"].min())
     except Exception as e:
         log.debug("ORB computation skipped: %s", e)
@@ -158,13 +227,17 @@ def fibonacci_levels(swing_high: float, swing_low: float) -> dict:
     return {"retracements": retracements, "extensions": extensions}
 
 
-def detect_swing_high(df: pd.DataFrame, lookback: int = 20) -> float:
+def detect_swing_high(df: pd.DataFrame, lookback: int = 20) -> float | None:
     """Highest high in the last `lookback` bars."""
+    if not _validate(df, {"high"}, 1, "detect_swing_high"):
+        return None
     recent = df["high"].iloc[-lookback:] if len(df) >= lookback else df["high"]
     return float(recent.max())
 
 
-def detect_swing_low(df: pd.DataFrame, lookback: int = 20) -> float:
+def detect_swing_low(df: pd.DataFrame, lookback: int = 20) -> float | None:
     """Lowest low in the last `lookback` bars."""
+    if not _validate(df, {"low"}, 1, "detect_swing_low"):
+        return None
     recent = df["low"].iloc[-lookback:] if len(df) >= lookback else df["low"]
     return float(recent.min())

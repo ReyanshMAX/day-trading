@@ -34,11 +34,12 @@ class NewsWatcher:
         )
         self._hashes: dict[str, set[str]] = {t: set() for t in config.universe.tickers}
 
-    def _fetch_headlines(self, ticker: str) -> list[str]:
-        """Fetch recent headlines for a ticker from Alpaca News."""
+    async def _fetch_headlines(self, ticker: str) -> list[str]:
+        """Fetch recent headlines for a ticker from Alpaca News (non-blocking)."""
         try:
             request = NewsRequest(symbols=ticker, limit=10)
-            news = self._news_client.get_news(request)
+            loop = asyncio.get_event_loop()
+            news = await loop.run_in_executor(None, self._news_client.get_news, request)
             articles = news.news if hasattr(news, "news") else []
             return [a.headline for a in articles if a.headline]
         except Exception as e:
@@ -66,7 +67,7 @@ class NewsWatcher:
 
     async def _process_ticker(self, ticker: str) -> None:
         """Fetch headlines, check for new ones, trigger classify if needed."""
-        headlines = self._fetch_headlines(ticker)
+        headlines = await self._fetch_headlines(ticker)
         new_found = False
         for h in headlines:
             h_hash = self._md5(h)
@@ -89,7 +90,7 @@ class NewsWatcher:
         log.info("Morning sweep complete")
 
     async def _classify_for_morning(self, ticker: str) -> None:
-        headlines = self._fetch_headlines(ticker)
+        headlines = await self._fetch_headlines(ticker)
         for h in headlines:
             self._hashes[ticker].add(self._md5(h))
         prior = self._regime_store.get(ticker)
@@ -98,9 +99,14 @@ class NewsWatcher:
         self._regime_store.set(ticker, state)
 
     async def watch(self) -> None:
-        """Continuous news polling loop."""
+        """Continuous news polling loop. All tickers processed in parallel each pass."""
         interval = self._config.regime.news_poll_interval_seconds
         while True:
-            for ticker in self._active_tickers():
-                await self._process_ticker(ticker)
+            results = await asyncio.gather(
+                *[self._process_ticker(t) for t in self._active_tickers()],
+                return_exceptions=True,
+            )
+            for ticker, result in zip(self._active_tickers(), results):
+                if isinstance(result, Exception):
+                    log.error("watch() error for %s: %s", ticker, result)
             await asyncio.sleep(interval)

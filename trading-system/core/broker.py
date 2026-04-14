@@ -4,6 +4,7 @@ Single responsibility: all communication with the Alpaca paper trading API.
 No signal logic, no risk logic — pure I/O.
 """
 
+import asyncio
 import logging
 import math
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from alpaca.trading.models import Order
 from alpaca.trading.requests import (
     MarketOrderRequest, StopLimitOrderRequest,
     OrderClass, StopLossRequest, TakeProfitRequest,
+    GetOrdersRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
@@ -22,15 +24,12 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data import DataFeed
 
 from core.config import Config
+from core.utils import is_crypto
 
 log = logging.getLogger(__name__)
 
 _asset_cache: dict[str, bool] = {}
-
-
-def _is_crypto(ticker: str) -> bool:
-    """Return True if ticker is a crypto pair (e.g. BTC/USD, ETHUSD)."""
-    return "/" in ticker or ticker.endswith("USD") and len(ticker) > 4
+_crypto_stop_orders: dict[str, str] = {}  # ticker -> stop order ID, populated by _submit_crypto_orders
 
 
 def _price_decimals(price: float) -> int:
@@ -44,6 +43,12 @@ def _price_decimals(price: float) -> int:
     if price < 10.0:
         return 4
     return 2
+
+
+async def _run_in_executor(func, *args):
+    """Run a synchronous blocking call in a thread pool executor."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, func, *args)
 
 
 class AlpacaBroker:
@@ -65,27 +70,50 @@ class AlpacaBroker:
         )
         self._config = config
 
-    def get_account(self) -> dict:
+    async def get_account(self) -> dict:
         """Return NAV, buying power, and cash from the paper account."""
-        acct = self._trading.get_account()
+        acct = await _run_in_executor(self._trading.get_account)
         return {
             "nav": float(acct.portfolio_value),
             "buying_power": float(acct.buying_power),
             "cash": float(acct.cash),
         }
 
-    def get_positions(self) -> list:
-        """Return all open positions."""
-        return self._trading.get_all_positions()
+    async def get_positions(self) -> list:
+        """Return all open positions from the broker (async, run in thread pool)."""
+        return await _run_in_executor(self._trading.get_all_positions)
+
+    async def cancel_all_orders_for(self, ticker: str) -> None:
+        """Cancel all open orders for a specific ticker.
+
+        TradingClient.cancel_orders() cancels everything; there is no built-in
+        per-symbol cancel endpoint. This fetches open orders filtered by symbol
+        and cancels each individually.
+        """
+        try:
+            request = GetOrdersRequest(symbols=[ticker])
+            orders = await _run_in_executor(self._trading.get_orders, request)
+            for order in orders:
+                try:
+                    await _run_in_executor(self._trading.cancel_order_by_id, str(order.id))
+                    log.info("Cancelled order %s for %s via cancel_all_orders_for", order.id, ticker)
+                except Exception as e:
+                    log.warning("Failed to cancel order %s for %s: %s", order.id, ticker, e)
+        except Exception as e:
+            log.error("cancel_all_orders_for(%s) failed: %s", ticker, e)
 
     def get_open_orders(self) -> list:
         """Return all open orders."""
         return self._trading.get_orders()
 
-    def cancel_order(self, order_id: str) -> None:
+    async def cancel_order(self, order_id: str) -> None:
         """Cancel an order by ID."""
-        self._trading.cancel_order_by_id(order_id)
+        await _run_in_executor(self._trading.cancel_order_by_id, order_id)
         log.info("Cancelled order %s", order_id)
+
+    def pop_crypto_stop_order_id(self, ticker: str) -> str | None:
+        """Return and remove the pending GTC stop order ID for a crypto ticker, if any."""
+        return _crypto_stop_orders.pop(ticker, None)
 
     async def submit_bracket_order(
         self,
@@ -101,8 +129,8 @@ class AlpacaBroker:
         Crypto: market entry + separate stop-limit + limit orders (Alpaca does
         not support bracket order_class for crypto).
         """
-        if _is_crypto(ticker):
-            return self._submit_crypto_orders(ticker, qty, side, stop_price, take_profit_price)
+        if is_crypto(ticker):
+            return await self._submit_crypto_orders(ticker, qty, side, stop_price, take_profit_price)
 
         alpaca_side = OrderSide.BUY if side == "long" else OrderSide.SELL
         request = MarketOrderRequest(
@@ -114,14 +142,14 @@ class AlpacaBroker:
             stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
             take_profit=TakeProfitRequest(limit_price=round(take_profit_price, 2)),
         )
-        order = self._trading.submit_order(request)
+        order = await _run_in_executor(self._trading.submit_order, request)
         log.info(
             "Bracket order submitted: %s %s qty=%d stop=%.2f target=%.2f order_id=%s",
             ticker, side, qty, stop_price, take_profit_price, order.id,
         )
         return order
 
-    def _submit_crypto_orders(
+    async def _submit_crypto_orders(
         self,
         ticker: str,
         qty: int,
@@ -140,12 +168,15 @@ class AlpacaBroker:
         exit_side = OrderSide.SELL if side == "long" else OrderSide.BUY
 
         # 1. Entry
-        entry_order = self._trading.submit_order(MarketOrderRequest(
-            symbol=ticker,
-            qty=qty,
-            side=entry_side,
-            time_in_force=TimeInForce.GTC,
-        ))
+        entry_order = await _run_in_executor(
+            self._trading.submit_order,
+            MarketOrderRequest(
+                symbol=ticker,
+                qty=qty,
+                side=entry_side,
+                time_in_force=TimeInForce.GTC,
+            ),
+        )
         log.info(
             "Crypto entry submitted: %s %s qty=%s order_id=%s",
             ticker, side, qty, entry_order.id,
@@ -168,16 +199,20 @@ class AlpacaBroker:
         stop_rounded = round(stop_price, dp)
         stop_limit = round(stop_price * (0.999 if side == "long" else 1.001), dp)
         try:
-            self._trading.submit_order(StopLimitOrderRequest(
-                symbol=ticker,
-                qty=exit_qty,
-                side=exit_side,
-                time_in_force=TimeInForce.GTC,
-                stop_price=stop_rounded,
-                limit_price=stop_limit,
-            ))
-            log.info("Crypto stop-loss submitted: %s stop=%.*f limit=%.*f qty=%.8f",
-                     ticker, dp, stop_price, dp, stop_limit, exit_qty)
+            stop_order = await _run_in_executor(
+                self._trading.submit_order,
+                StopLimitOrderRequest(
+                    symbol=ticker,
+                    qty=exit_qty,
+                    side=exit_side,
+                    time_in_force=TimeInForce.GTC,
+                    stop_price=stop_rounded,
+                    limit_price=stop_limit,
+                ),
+            )
+            _crypto_stop_orders[ticker] = str(stop_order.id)
+            log.info("Crypto stop-loss submitted: %s stop=%.*f limit=%.*f qty=%.8f order_id=%s",
+                     ticker, dp, stop_price, dp, stop_limit, exit_qty, stop_order.id)
         except Exception as e:
             log.error("Crypto stop-loss order failed for %s: %s", ticker, e)
 
@@ -189,17 +224,17 @@ class AlpacaBroker:
 
         return entry_order
 
-    async def submit_market_order(self, ticker: str, qty: int, side: str) -> None:
+    async def submit_market_order(self, ticker: str, qty: int, side: str) -> object:
         """Submit a plain market order (used for EOD close-all)."""
         alpaca_side = OrderSide.SELL if side == "sell" else OrderSide.BUY
-        tif = TimeInForce.GTC if _is_crypto(ticker) else TimeInForce.DAY
+        tif = TimeInForce.GTC if is_crypto(ticker) else TimeInForce.DAY
         request = MarketOrderRequest(
             symbol=ticker,
             qty=qty,
             side=alpaca_side,
             time_in_force=tif,
         )
-        order = self._trading.submit_order(request)
+        order = await _run_in_executor(self._trading.submit_order, request)
         log.info("Market order submitted: %s %s qty=%d", ticker, side, qty)
         return order
 
@@ -214,11 +249,11 @@ class AlpacaBroker:
         tf = tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Minute))
 
         end = datetime.now(tz=timezone.utc)
-        # Crypto trades 24/7 so 1.5x is enough; equities need 3x to skip non-trading gaps
-        multiplier = 2 if _is_crypto(ticker) else 3
+        # Crypto trades 24/7 so 2x is enough; equities need 10x to safely cover weekends/gaps
+        multiplier = 2 if is_crypto(ticker) else 10
         start = end - timedelta(minutes=limit * multiplier)
 
-        if _is_crypto(ticker):
+        if is_crypto(ticker):
             request = CryptoBarsRequest(
                 symbol_or_symbols=ticker,
                 timeframe=tf,
@@ -264,12 +299,12 @@ class AlpacaBroker:
         Crypto tickers (e.g. BTC/USD) are always tradable 24/7 — skip the REST
         call entirely since the slash in the symbol breaks the URL path.
         """
-        if _is_crypto(ticker):
+        if is_crypto(ticker):
             return True
         if ticker in _asset_cache:
             return _asset_cache[ticker]
         try:
-            asset = self._trading.get_asset(ticker)
+            asset = await _run_in_executor(self._trading.get_asset, ticker)
             result = bool(asset.tradable) and str(asset.status).lower() in ("active", "assetstatus.active")
         except Exception as e:
             log.warning("Could not check tradability for %s: %s", ticker, e)

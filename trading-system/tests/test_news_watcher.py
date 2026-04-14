@@ -29,7 +29,7 @@ def make_watcher(config, classifier, regime_store, fetch_side_effect=None):
     watcher._news_client = MagicMock()
     watcher._hashes = {t: set() for t in config.universe.tickers}
     if fetch_side_effect is not None:
-        watcher._fetch_headlines = MagicMock(side_effect=fetch_side_effect)
+        watcher._fetch_headlines = AsyncMock(side_effect=fetch_side_effect)
     return watcher
 
 
@@ -42,7 +42,7 @@ async def test_first_poll_triggers_classifier_and_stores_hashes():
     regime_store = RegimeStore()
 
     watcher = make_watcher(config, classifier, regime_store)
-    watcher._fetch_headlines = MagicMock(return_value=["Headline A", "Headline B", "Headline C"])
+    watcher._fetch_headlines = AsyncMock(return_value=["Headline A", "Headline B", "Headline C"])
 
     await watcher._process_ticker("NVDA")
 
@@ -59,7 +59,7 @@ async def test_second_poll_same_headlines_does_not_trigger_classifier():
     regime_store = RegimeStore()
 
     watcher = make_watcher(config, classifier, regime_store)
-    watcher._fetch_headlines = MagicMock(return_value=["Headline A", "Headline B", "Headline C"])
+    watcher._fetch_headlines = AsyncMock(return_value=["Headline A", "Headline B", "Headline C"])
 
     await watcher._process_ticker("NVDA")  # first poll
     await watcher._process_ticker("NVDA")  # second poll — same headlines
@@ -80,7 +80,7 @@ async def test_new_headline_in_second_poll_triggers_classifier():
         ["Headline A", "Headline B"],
         ["Headline A", "Headline B", "New Headline D"],
     ]
-    watcher._fetch_headlines = MagicMock(side_effect=responses)
+    watcher._fetch_headlines = AsyncMock(side_effect=responses)
 
     await watcher._process_ticker("NVDA")
     await watcher._process_ticker("NVDA")
@@ -100,7 +100,7 @@ async def test_morning_sweep_calls_classifier_for_all_tickers():
     regime_store = RegimeStore()
 
     watcher = make_watcher(config, classifier, regime_store)
-    watcher._fetch_headlines = MagicMock(return_value=["Some headline"])
+    watcher._fetch_headlines = AsyncMock(return_value=["Some headline"])
 
     await watcher.run_morning_sweep()
 

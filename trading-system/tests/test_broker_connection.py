@@ -16,8 +16,9 @@ def broker():
 
 
 @pytest.mark.integration
-def test_get_account_returns_positive_nav(broker):
-    account = broker.get_account()
+@pytest.mark.asyncio
+async def test_get_account_returns_positive_nav(broker):
+    account = await broker.get_account()
     assert isinstance(account["nav"], float)
     assert account["nav"] > 0
 
