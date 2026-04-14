@@ -31,6 +31,7 @@ async def close_all_positions_eod(
     broker: AlpacaBroker,
     portfolio: Portfolio,
     shutdown: asyncio.Event,
+    chroma: "ChromaStore | None" = None,
 ) -> None:
     """Sleeps until 3:55 PM ET, closes all equity positions, then sets the shutdown event."""
     et = timezone("America/New_York")
@@ -47,12 +48,20 @@ async def close_all_positions_eod(
     await asyncio.sleep(wait_seconds)
 
     log.info("EOD: closing equity positions")
+    from datetime import timezone as _tz
+    date_str = datetime.now(tz=_tz.utc).date().isoformat()
     for ticker, pos in list(portfolio.positions.items()):
         if _is_crypto(ticker):
             log.info("EOD: skipping crypto position %s (24/7 market)", ticker)
             continue
         side = "sell" if pos.side == "long" else "buy"
-        await broker.submit_market_order(ticker, pos.qty, side)
+        close_order = await broker.submit_market_order(ticker, pos.qty, side)
+        pnl_pct = portfolio.record_close(close_order)
+        if chroma is not None and pnl_pct is not None:
+            try:
+                chroma.update_outcome(ticker, date_str, pnl_pct)
+            except Exception as e:
+                log.error("EOD update_outcome failed for %s: %s", ticker, e)
     shutdown.set()
 
 
@@ -69,7 +78,7 @@ async def main() -> None:
     positions = await broker.get_positions()
     portfolio.reconcile_positions(positions)
     regime_store = RegimeStore()
-    chroma = ChromaStore()
+    chroma = ChromaStore(min_outcomes_for_summary=config.memory.min_outcomes_for_summary)
     bar_store = BarStore()
 
     log.info("Backfilling bars...")
@@ -80,14 +89,14 @@ async def main() -> None:
         except Exception as e:
             log.error("Backfill failed for %s: %s", ticker, e)
 
-    classifier = RegimeClassifier(config, chroma)
+    classifier = RegimeClassifier(config, chroma, broker=broker)
     news_watcher = NewsWatcher(config, classifier, regime_store)
     log.info("Running morning regime sweep...")
     await news_watcher.run_morning_sweep()
 
     signal_engine = SignalEngine(config, bar_store, regime_store)
     order_manager = OrderManager(config)
-    executor = Executor(broker, portfolio, signal_engine, order_manager, gate_check, config)
+    executor = Executor(broker, portfolio, signal_engine, order_manager, gate_check, config, chroma_store=chroma)
 
     shutdown = asyncio.Event()
 
@@ -101,7 +110,7 @@ async def main() -> None:
                      api_key=config.alpaca_api_key, secret_key=config.alpaca_secret_key)
     )
     watch_task = asyncio.create_task(news_watcher.watch())
-    eod_task = asyncio.create_task(close_all_positions_eod(broker, portfolio, shutdown))
+    eod_task = asyncio.create_task(close_all_positions_eod(broker, portfolio, shutdown, chroma=chroma))
     score_log_task = asyncio.create_task(signal_engine.log_scores_loop(crypto_tickers))
     duration_task = asyncio.create_task(executor.check_position_durations())
 

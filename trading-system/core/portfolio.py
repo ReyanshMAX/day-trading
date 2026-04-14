@@ -124,12 +124,17 @@ class Portfolio:
         except Exception as e:
             log.error("record_fill failed: %s", e)
 
-    def record_close(self, order) -> None:
-        """Remove a position and update daily P&L."""
+    def record_close(self, order) -> float | None:
+        """Remove a position and update daily P&L.
+
+        Returns pnl_pct (pnl / nav at close time) so callers can update
+        ChromaDB outcome records. Returns None if the exit price is missing
+        or invalid (P&L is not updated in that case either).
+        """
         try:
             ticker = str(order.symbol)
             if ticker not in self.positions:
-                return
+                return None
             pos = self.positions.pop(ticker)
             raw_exit = order.filled_avg_price
             if not raw_exit:
@@ -137,23 +142,26 @@ class Portfolio:
                     "record_close: filled_avg_price is None/0 for %s order=%s — skipping P&L update",
                     ticker, getattr(order, "id", "unknown"),
                 )
-                return
+                return None
             exit_price = float(raw_exit)
             if exit_price == 0.0:
                 log.error(
                     "record_close: filled_avg_price is 0 for %s order=%s — skipping P&L update",
                     ticker, getattr(order, "id", "unknown"),
                 )
-                return
+                return None
             if pos.side == "long":
                 pnl = (exit_price - pos.avg_entry) * pos.qty
             else:
                 pnl = (pos.avg_entry - exit_price) * pos.qty
             self.daily_pnl += pnl
             self.nav += pnl
+            pnl_pct = pnl / self.nav if self.nav > 0 else 0.0
             log.info(
-                "Position closed: %s pnl=%.2f daily_pnl=%.2f nav=%.2f",
-                ticker, pnl, self.daily_pnl, self.nav,
+                "Position closed: %s pnl=%.2f pnl_pct=%.4f daily_pnl=%.2f nav=%.2f",
+                ticker, pnl, pnl_pct, self.daily_pnl, self.nav,
             )
+            return pnl_pct
         except Exception as e:
             log.error("record_close failed: %s", e)
+            return None

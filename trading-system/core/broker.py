@@ -102,10 +102,6 @@ class AlpacaBroker:
         except Exception as e:
             log.error("cancel_all_orders_for(%s) failed: %s", ticker, e)
 
-    def get_open_orders(self) -> list:
-        """Return all open orders."""
-        return self._trading.get_orders()
-
     async def cancel_order(self, order_id: str) -> None:
         """Cancel an order by ID."""
         await _run_in_executor(self._trading.cancel_order_by_id, order_id)

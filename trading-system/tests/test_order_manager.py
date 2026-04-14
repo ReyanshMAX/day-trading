@@ -21,6 +21,7 @@ def make_config() -> Config:
             max_position_pct=0.10,
             max_sector_positions=4,
             daily_loss_limit_pct=0.03,
+            max_position_duration_minutes=90,
         ),
         signal=SignalConfig(
             entry_threshold=0.55, atr_period=14, ema_fast=9, ema_slow=21, rsi_period=14,

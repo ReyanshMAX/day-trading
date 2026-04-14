@@ -51,6 +51,8 @@ def make_engine(bars_df: pd.DataFrame, regime: RegimeState | None = None) -> Sig
     config.signal.rsi_period = 14
     config.signal.orb_window_minutes = 15
     config.signal.entry_threshold = 0.3
+    config.signal.min_bars = 30
+    config.signal.confidence_threshold = 0.6
     config.regime.min_conviction_to_trade = 2
 
     return SignalEngine(config, bar_store, regime_store)
@@ -137,6 +139,8 @@ def test_confidence_below_threshold_suppresses_signal():
     config.signal.rsi_period = 200  # > 101 rows → rsi() returns None
     config.signal.orb_window_minutes = 15
     config.signal.entry_threshold = 0.3
+    config.signal.min_bars = 30
+    config.signal.confidence_threshold = 0.6
     config.regime.min_conviction_to_trade = 2
 
     engine = SignalEngine(config, bar_store, regime_store)
@@ -204,6 +208,8 @@ def test_on_tick_no_bars_returns_none():
     config.signal.rsi_period = 14
     config.signal.orb_window_minutes = 15
     config.signal.entry_threshold = 0.3
+    config.signal.min_bars = 30
+    config.signal.confidence_threshold = 0.6
     config.regime.min_conviction_to_trade = 2
 
     engine = SignalEngine(config, bar_store, regime_store)

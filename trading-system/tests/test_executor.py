@@ -61,6 +61,9 @@ def _make_executor(
 
     signal_engine = MagicMock()
     signal_engine.on_tick.return_value = signal_return
+    # Prevent the stale-regime check from receiving a MagicMock timestamp
+    # that can't be compared with a real datetime.
+    signal_engine._regime_store = None
     bar_df = MagicMock()
     bar_df.__len__ = lambda s: 5  # < 20 bars → no fib
     signal_engine.get_bars.return_value = bar_df
@@ -191,6 +194,7 @@ async def test_soft_target_never_moves_backward():
 
     config = MagicMock()
     config.risk.max_portfolio_heat_pct = 0.06
+    config.execution.min_trail_increment_atr_fraction = 0.1
 
     executor = Executor(
         broker=broker,

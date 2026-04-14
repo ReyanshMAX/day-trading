@@ -15,21 +15,10 @@ universe:
     - COIN
     - MSTR
     - ARKK
-    - BTC/USD
-    - ETH/USD
-    - SOL/USD
 
 account:
   paper: true
   nav: 100000
-
-risk:
-  max_trade_risk_pct: 0.01
-  max_position_pct: 0.10
-  max_portfolio_heat_pct: 0.06
-  max_sector_positions: 5
-  daily_loss_limit_pct: 0.03
-  max_position_duration_minutes: 90
 
 signal:
   entry_threshold: 0.25
@@ -39,6 +28,8 @@ signal:
   rsi_period: 14
   vwap_deviation_bands: [1.0, 2.0, 2.5]
   orb_window_minutes: 15
+  min_bars: 30
+  confidence_threshold: 0.6
 
 regime:
   news_poll_interval_seconds: 120
@@ -46,6 +37,26 @@ regime:
 
 llm:
   groq_model: "llama-3.1-8b-instant"
+  cache_ttl_minutes: 10
+  stale_regime_minutes: 120
+
+risk:
+  max_trade_risk_pct: 0.01
+  max_position_pct: 0.10
+  max_portfolio_heat_pct: 0.06
+  max_sector_positions: 5
+  daily_loss_limit_pct: 0.03
+  max_position_duration_minutes: 90
+  asset_cache_refresh_seconds: 60
+  duration_check_interval_seconds: 300
+
+execution:
+  order_retry_sleep_seconds: 0.5
+  latency_warn_seconds: 0.1
+  min_trail_increment_atr_fraction: 0.1
+
+memory:
+  min_outcomes_for_summary: 5
 
 rr_profiles:
   trending:

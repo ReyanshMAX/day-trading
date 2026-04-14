@@ -6,6 +6,7 @@ deterministic float score in [-1.0, 1.0].
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ class RegimeState:
     direction: str    # "bullish" | "bearish" | "neutral"
     catalyst: str = ""
     avoid_reason: str | None = None
+    last_classified_at: datetime | None = None
+    last_headlines_hash: str = ""
 
 
 def compute_score(

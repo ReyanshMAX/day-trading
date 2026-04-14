@@ -72,8 +72,9 @@ def _resolve_orb(
     session_state.set_orb(ticker, orb_high, orb_low)
     log.debug("%s ORB locked: high=%.4f low=%.4f", ticker, orb_high, orb_low)
     return orb_high, orb_low
-_MIN_BARS = 30              # minimum closed bars required before scoring
-_CONFIDENCE_THRESHOLD = 0.6
+# Module-level defaults; actual values are read from config at runtime.
+_MIN_BARS = 30              # mirrors config.signal.min_bars
+_CONFIDENCE_THRESHOLD = 0.6  # mirrors config.signal.confidence_threshold
 _EXPECTED_COMPONENTS = 8    # ema, vwap, vwap_bands, atr, rsi, macd, rvol, orb
 
 
@@ -104,8 +105,8 @@ class SignalEngine:
         """
         df = self._bar_store.get_bars(ticker, 100)
 
-        # 30-bar minimum guard — must be checked before any indicator calls
-        if len(df) < _MIN_BARS:
+        # minimum bar guard — must be checked before any indicator calls
+        if len(df) < self._config.signal.min_bars:
             return None
 
         regime_state = self._regime_store.get(ticker)
@@ -195,8 +196,9 @@ class SignalEngine:
             ticker, confidence, non_none_count, _EXPECTED_COMPONENTS,
         )
 
-        if confidence < _CONFIDENCE_THRESHOLD:
-            log.debug("%s: confidence %.2f below threshold %.2f — signal suppressed", ticker, confidence, _CONFIDENCE_THRESHOLD)
+        confidence_threshold = self._config.signal.confidence_threshold
+        if confidence < confidence_threshold:
+            log.debug("%s: confidence %.2f below threshold %.2f — signal suppressed", ticker, confidence, confidence_threshold)
             return None
 
         # Substitute safe defaults for None values so IndicatorSnapshot can be constructed.
@@ -286,7 +288,7 @@ class SignalEngine:
             result = self._compute(ticker, price)
             if result is None:
                 df = self._bar_store.get_bars(ticker, 100)
-                log.info("%s — bars=%d (need %d to score)", ticker, len(df), _MIN_BARS)
+                log.info("%s — bars=%d (need %d to score)", ticker, len(df), self._config.signal.min_bars)
                 continue
 
             snapshot, score, regime_state, confidence = result

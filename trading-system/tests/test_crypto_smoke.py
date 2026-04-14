@@ -45,6 +45,8 @@ def make_config() -> SimpleNamespace:
             vwap_deviation_bands=[1.0, 2.0, 2.5],
             orb_window_minutes=15,
             entry_threshold=0.55,
+            min_bars=30,
+            confidence_threshold=0.6,
         ),
         regime=SimpleNamespace(min_conviction_to_trade=3),
         risk=SimpleNamespace(
@@ -56,6 +58,12 @@ def make_config() -> SimpleNamespace:
         ),
         account=SimpleNamespace(nav=100_000),
         rr_profiles={"trending": trending, "ranging": ranging},
+        execution=SimpleNamespace(
+            order_retry_sleep_seconds=0.5,
+            latency_warn_seconds=0.1,
+            min_trail_increment_atr_fraction=0.1,
+        ),
+        llm=SimpleNamespace(stale_regime_minutes=120),
     )
 
 
@@ -204,13 +212,14 @@ async def test_crypto_no_order_on_avoid_regime():
 
 @pytest.mark.asyncio
 async def test_crypto_no_order_when_not_tradable():
-    """Broker marks ticker not tradable → pipeline exits before signal engine."""
+    """Cache marks ticker not tradable → pipeline exits before signal engine."""
     bars = make_uptrend_bars()
     regime = RegimeState(
         regime="trending", direction="bullish", conviction=4, catalyst="smoke test"
     )
     executor, broker = make_executor(bars, regime)
-    broker.is_tradable = AsyncMock(return_value=False)
+    # Pre-populate cache — the hot path does an O(1) dict lookup, not a broker call.
+    executor._asset_tradable_cache[TICKER] = False
 
     tick_price = float(bars["close"].iloc[-1]) + 200.0
     await executor.on_tick(TICKER, tick_price, 3.0, datetime.now(tz=timezone.utc))

@@ -13,12 +13,11 @@ from core.broker import AlpacaBroker
 from core.config import Config
 from core.order_manager import OrderManager
 from core.portfolio import Portfolio
+from memory.chroma_store import ChromaStore
 from signals.engine import SignalEngine
 from signals.indicators import fibonacci_levels, detect_swing_high, detect_swing_low
 
 log = logging.getLogger(__name__)
-
-_LATENCY_WARN_SECONDS = 0.1  # 100 ms
 
 
 class Executor:
@@ -32,6 +31,7 @@ class Executor:
         order_manager: OrderManager,
         risk_gate,
         config: Config,
+        chroma_store: ChromaStore | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -39,13 +39,24 @@ class Executor:
         self._order_manager = order_manager
         self._risk_gate = risk_gate  # callable: (ticker, direction, qty, stop_distance, portfolio, config) -> GateResult
         self._config = config
+        self._chroma = chroma_store
         # Cache populated by refresh_asset_cache() background coroutine.
         # Defaults to True (tradable) when a ticker has not yet been evaluated
         # so that early ticks are not silently dropped before the first refresh.
         self._asset_tradable_cache: dict[str, bool] = {}
 
+    def _record_close_and_update_chroma(self, close_order, ticker: str) -> None:
+        """Call record_close and, if pnl_pct is available, update ChromaDB outcome."""
+        pnl_pct = self._portfolio.record_close(close_order)
+        if self._chroma is not None and pnl_pct is not None:
+            date_str = datetime.now(timezone.utc).date().isoformat()
+            try:
+                self._chroma.update_outcome(ticker, date_str, pnl_pct)
+            except Exception as e:
+                log.error("update_outcome failed for %s: %s", ticker, e)
+
     async def refresh_asset_cache(self) -> None:
-        """Background coroutine: refresh tradability for all config tickers every 60 s."""
+        """Background coroutine: refresh tradability for all config tickers."""
         tickers = self._config.universe.tickers
         while True:
             for ticker in tickers:
@@ -54,7 +65,7 @@ class Executor:
                     self._asset_tradable_cache[ticker] = tradable
                 except Exception as e:
                     log.warning("refresh_asset_cache: is_tradable(%s) failed: %s", ticker, e)
-            await asyncio.sleep(60)
+            await asyncio.sleep(self._config.risk.asset_cache_refresh_seconds)
 
     async def on_tick(self, ticker: str, price: float, volume: float, timestamp: datetime) -> None:
         """Process a single market tick. Errors are caught and logged — never propagated."""
@@ -80,7 +91,7 @@ class Executor:
                     # For longs the target trails upward only; for shorts downward only.
                     # Minimum increment: 0.1 * atr — suppress noise updates.
                     if pos.atr > 0:
-                        min_increment = 0.1 * pos.atr
+                        min_increment = self._config.execution.min_trail_increment_atr_fraction * pos.atr
                         if pos.side == "long":
                             # New candidate: price + same distance as original bracket
                             original_dist = pos.target - pos.avg_entry
@@ -155,18 +166,19 @@ class Executor:
                                 close_order = await self._broker.submit_market_order(
                                     ticker, pos.qty, close_side
                                 )
-                                self._portfolio.record_close(close_order)
+                                self._record_close_and_update_chroma(close_order, ticker)
                             except Exception as first_err:
+                                retry_sleep = self._config.execution.order_retry_sleep_seconds
                                 log.error(
-                                    "Soft take-profit close failed for %s (attempt 1/2): %s — retrying in 0.5s",
-                                    ticker, first_err,
+                                    "Soft take-profit close failed for %s (attempt 1/2): %s — retrying in %.1fs",
+                                    ticker, first_err, retry_sleep,
                                 )
-                                await asyncio.sleep(0.5)
+                                await asyncio.sleep(retry_sleep)
                                 try:
                                     close_order = await self._broker.submit_market_order(
                                         ticker, pos.qty, close_side
                                     )
-                                    self._portfolio.record_close(close_order)
+                                    self._record_close_and_update_chroma(close_order, ticker)
                                 except Exception as second_err:
                                     log.critical(
                                         "Soft take-profit close FAILED after 2 attempts for %s: %s "
@@ -230,11 +242,24 @@ class Executor:
             if not gate.approved:
                 log.debug("Gate rejected %s: %s", ticker, gate.reason)
                 elapsed = time.monotonic() - t0
-                if elapsed > _LATENCY_WARN_SECONDS:
+                if elapsed > self._config.execution.latency_warn_seconds:
                     log.warning("on_tick latency %s: %.1f ms (suppressed at gate)", ticker, elapsed * 1000)
                 return
 
-            # 7. Submit order
+            # 7. Submit order — warn if regime classification is stale (> 2 hours old)
+            regime_state = getattr(signal, "regime_state", None)
+            if regime_state is None:
+                # Attempt to get it from the signal engine's regime store if available
+                regime_store = getattr(self._signal_engine, "_regime_store", None)
+                if regime_store is not None:
+                    regime_state = regime_store.get(ticker)
+            if regime_state is not None and regime_state.last_classified_at is not None:
+                age = datetime.now(timezone.utc) - regime_state.last_classified_at
+                if age.total_seconds() > self._config.llm.stale_regime_minutes * 60:
+                    log.warning(
+                        "Stale regime for %s: classified %d minutes ago.",
+                        ticker, int(age.total_seconds() / 60),
+                    )
             order = await self._broker.submit_bracket_order(
                 ticker,
                 bracket.qty,
@@ -254,7 +279,7 @@ class Executor:
                 atr=signal.atr,
             )
             elapsed = time.monotonic() - t0
-            if elapsed > _LATENCY_WARN_SECONDS:
+            if elapsed > self._config.execution.latency_warn_seconds:
                 log.warning("on_tick latency %s: %.1f ms (order submitted)", ticker, elapsed * 1000)
             log.info(
                 "Order fired: %s %s qty=%s stop=%s target=%s score=%.3f regime=%s conviction=%d",
@@ -271,7 +296,7 @@ class Executor:
         """Periodically close positions that have exceeded max_position_duration_minutes."""
         max_minutes = self._config.risk.max_position_duration_minutes
         while True:
-            await asyncio.sleep(300)
+            await asyncio.sleep(self._config.risk.duration_check_interval_seconds)
             now = datetime.now(timezone.utc)
             for ticker, pos in list(self._portfolio.positions.items()):
                 elapsed_seconds = (now - pos.entry_time).total_seconds()
@@ -284,6 +309,6 @@ class Executor:
                     )
                     try:
                         close_order = await self._broker.submit_market_order(ticker, pos.qty, side)
-                        self._portfolio.record_close(close_order)
+                        self._record_close_and_update_chroma(close_order, ticker)
                     except Exception as e:
                         log.error("Duration close failed for %s: %s", ticker, e, exc_info=True)

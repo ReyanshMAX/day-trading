@@ -38,18 +38,18 @@ Generated from audit.md on 2026-04-13.
 ## Step 4 — Execution Path Improvements
 - [x] DONE: 4A Order fill detection and race condition
 - [x] DONE: 4B Trailing soft target hardening
-- [ ] PENDING: 4C Async hot path audit
+- [x] DONE: 4C Async hot path audit
 
 ## Step 5 — Regime Classifier Improvements
-- [ ] PENDING: 5A Prompt quality
-- [ ] PENDING: 5B Classification caching
+- [x] DONE: 5A Prompt quality
+- [x] DONE: 5B Classification caching
 
 ## Step 6 — Memory Improvements
-- [ ] PENDING: 6A Outcome tracking completeness
+- [x] DONE: 6A Outcome tracking completeness
 
 ## Step 7 — Final Cleanup
-- [ ] PENDING: 7A Dead code and config consolidation
-- [ ] PENDING: 7B Final test suite
+- [x] DONE: 7A Dead code and config consolidation
+- [x] DONE: 7B Final test suite — 75/75 passing, 0 failures
 
 ## Known Failures
 (none yet)

@@ -139,16 +139,6 @@ def macd(df: pd.DataFrame) -> tuple[float, float, float] | tuple[None, None, Non
     return mv, sv, hv
 
 
-def obv(df: pd.DataFrame) -> pd.Series | None:
-    """On-Balance Volume."""
-    if not _validate(df, {"close", "volume"}, 1, "obv"):
-        return None
-    result = ta.obv(df["close"], df["volume"])
-    if result is None:
-        return None
-    return result
-
-
 def rvol(df: pd.DataFrame, lookback: int = 20) -> float:
     """Relative volume: current bar volume vs average volume at this time of day.
 

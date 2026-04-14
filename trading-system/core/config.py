@@ -34,6 +34,8 @@ class RiskConfig:
     max_sector_positions: int
     daily_loss_limit_pct: float
     max_position_duration_minutes: int
+    asset_cache_refresh_seconds: int = 60
+    duration_check_interval_seconds: int = 300
 
 
 @dataclass
@@ -45,6 +47,8 @@ class SignalConfig:
     rsi_period: int
     vwap_deviation_bands: list[float]
     orb_window_minutes: int
+    min_bars: int = 30
+    confidence_threshold: float = 0.6
 
 
 @dataclass
@@ -56,6 +60,20 @@ class RegimeConfig:
 @dataclass
 class LlmConfig:
     groq_model: str
+    cache_ttl_minutes: int = 10
+    stale_regime_minutes: int = 120
+
+
+@dataclass
+class ExecutionConfig:
+    order_retry_sleep_seconds: float = 0.5
+    latency_warn_seconds: float = 0.1
+    min_trail_increment_atr_fraction: float = 0.1
+
+
+@dataclass
+class MemoryConfig:
+    min_outcomes_for_summary: int = 5
 
 
 @dataclass
@@ -74,6 +92,8 @@ class Config:
     regime: RegimeConfig
     llm: LlmConfig
     rr_profiles: dict[str, RRProfile]
+    execution: "ExecutionConfig" = field(default_factory=ExecutionConfig)
+    memory: "MemoryConfig" = field(default_factory=MemoryConfig)
 
     # Env-loaded secrets
     alpaca_api_key: str = ""
@@ -136,6 +156,8 @@ def load_config(config_path: str | None = None) -> Config:
             max_sector_positions=int(raw["risk"]["max_sector_positions"]),
             daily_loss_limit_pct=float(raw["risk"]["daily_loss_limit_pct"]),
             max_position_duration_minutes=int(raw["risk"]["max_position_duration_minutes"]),
+            asset_cache_refresh_seconds=int(raw["risk"].get("asset_cache_refresh_seconds", 60)),
+            duration_check_interval_seconds=int(raw["risk"].get("duration_check_interval_seconds", 300)),
         ),
         signal=SignalConfig(
             entry_threshold=float(raw["signal"]["entry_threshold"]),
@@ -145,6 +167,8 @@ def load_config(config_path: str | None = None) -> Config:
             rsi_period=int(raw["signal"]["rsi_period"]),
             vwap_deviation_bands=[float(v) for v in raw["signal"]["vwap_deviation_bands"]],
             orb_window_minutes=int(raw["signal"]["orb_window_minutes"]),
+            min_bars=int(raw["signal"].get("min_bars", 30)),
+            confidence_threshold=float(raw["signal"].get("confidence_threshold", 0.6)),
         ),
         regime=RegimeConfig(
             news_poll_interval_seconds=int(raw["regime"]["news_poll_interval_seconds"]),
@@ -152,6 +176,16 @@ def load_config(config_path: str | None = None) -> Config:
         ),
         llm=LlmConfig(
             groq_model=str(raw["llm"]["groq_model"]),
+            cache_ttl_minutes=int(raw["llm"].get("cache_ttl_minutes", 10)),
+            stale_regime_minutes=int(raw["llm"].get("stale_regime_minutes", 120)),
+        ),
+        execution=ExecutionConfig(
+            order_retry_sleep_seconds=float(raw.get("execution", {}).get("order_retry_sleep_seconds", 0.5)),
+            latency_warn_seconds=float(raw.get("execution", {}).get("latency_warn_seconds", 0.1)),
+            min_trail_increment_atr_fraction=float(raw.get("execution", {}).get("min_trail_increment_atr_fraction", 0.1)),
+        ),
+        memory=MemoryConfig(
+            min_outcomes_for_summary=int(raw.get("memory", {}).get("min_outcomes_for_summary", 5)),
         ),
         rr_profiles=rr_profiles,
         alpaca_api_key=alpaca_api_key,

@@ -3,7 +3,9 @@
 Uses AsyncMock to avoid real Groq API calls.
 """
 
+import hashlib
 import json
+from datetime import datetime, timezone
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,6 +28,7 @@ def make_mock_response(content: str):
 def make_classifier():
     config = MagicMock()
     config.groq_api_key = "test"
+    config.llm.cache_ttl_minutes = 10
     chroma = MagicMock()
     chroma.get_similar_contexts.return_value = []
     chroma.store_classification.return_value = None
@@ -111,3 +114,51 @@ async def test_api_exception_returns_fallback():
     state = await clf.classify("NVDA", [], None)
     assert state == fallback_regime()
     # Must not raise
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_calls_groq_exactly_once():
+    """Two classify() calls with identical headlines within 10 min → Groq called once."""
+    headlines = ["NVDA beats earnings", "Revenue up 20%"]
+
+    # Build a regime store mock whose get() returns None first call,
+    # then returns the cached state on the second call.
+    regime_store = MagicMock()
+    # First call: no cached state yet
+    # Second call: return a state that was classified just now with matching hash
+    joined = "; ".join(headlines[:5])
+    current_hash = hashlib.md5(joined.encode()).hexdigest()
+    cached_state = RegimeState(
+        regime="trending",
+        conviction=4,
+        direction="bullish",
+        catalyst="Strong earnings beat",
+        last_classified_at=datetime.now(timezone.utc),
+        last_headlines_hash=current_hash,
+    )
+    # First call returns None (cache miss), second returns the cached state
+    regime_store.get.side_effect = [None, cached_state]
+    regime_store.set = MagicMock()
+
+    clf = make_classifier()
+    clf._regime_store = regime_store
+    groq_mock = AsyncMock(return_value=make_mock_response(VALID_JSON))
+    clf._client = AsyncMock()
+    clf._client.chat = AsyncMock()
+    clf._client.chat.completions = AsyncMock()
+    clf._client.chat.completions.create = groq_mock
+
+    # First call — cache miss, Groq fires
+    await clf.classify("NVDA", headlines, "ranging")
+    # Simulate the regime store being updated after first classification
+    # (in production news_watcher calls regime_store.set; here we already
+    # set side_effect so second get() returns cached_state automatically)
+
+    # Second call — same headlines, cache should hit
+    state2 = await clf.classify("NVDA", headlines, "ranging")
+
+    assert groq_mock.call_count == 1, (
+        f"Expected Groq to be called exactly once, got {groq_mock.call_count}"
+    )
+    assert state2.regime == "trending"
+    assert state2.last_headlines_hash == current_hash
