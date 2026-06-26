@@ -49,6 +49,10 @@ class SignalConfig:
     orb_window_minutes: int
     min_bars: int = 30
     confidence_threshold: float = 0.6
+    atr_spike_multiplier: float = 3.0
+    rvol_trend_min: float = 1.5
+    rvol_ranging_min: float = 1.3
+    no_trade_windows: list = field(default_factory=list)
 
 
 @dataclass
@@ -84,6 +88,14 @@ class RRProfile:
 
 
 @dataclass
+class ForexConfig:
+    pairs: list[str]
+    risk_pct: float = 0.005
+    adx_trend_threshold: float = 25.0
+    size_unit: int = 1000
+
+
+@dataclass
 class Config:
     universe: UniverseConfig
     account: AccountConfig
@@ -94,6 +106,7 @@ class Config:
     rr_profiles: dict[str, RRProfile]
     execution: "ExecutionConfig" = field(default_factory=ExecutionConfig)
     memory: "MemoryConfig" = field(default_factory=MemoryConfig)
+    forex: "ForexConfig | None" = None
 
     # Env-loaded secrets
     alpaca_api_key: str = ""
@@ -101,6 +114,10 @@ class Config:
     alpaca_base_url: str = "https://paper-api.alpaca.markets"
     alpaca_data_url: str = "https://data.alpaca.markets"
     groq_api_key: str = ""
+    finnhub_api_key: str = ""
+    polygon_api_key: str = ""
+    oanda_api_key: str = ""
+    oanda_account_id: str = ""
 
 
 def load_config(config_path: str | None = None) -> Config:
@@ -120,6 +137,10 @@ def load_config(config_path: str | None = None) -> Config:
     alpaca_base_url = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
     alpaca_data_url = os.environ.get("ALPACA_DATA_URL", "https://data.alpaca.markets")
     groq_api_key = os.environ.get("GROQ_API_KEY", "")
+    finnhub_api_key = os.environ.get("FINNHUB_API_KEY", "")
+    polygon_api_key = os.environ.get("POLYGON_API_KEY", "")
+    oanda_api_key = os.environ.get("OANDA_API_KEY", "")
+    oanda_account_id = os.environ.get("OANDA_ACCOUNT_ID", "")
 
     assert alpaca_api_key, "ALPACA_API_KEY must be set in .env"
     assert alpaca_secret_key, "ALPACA_SECRET_KEY must be set in .env"
@@ -169,6 +190,10 @@ def load_config(config_path: str | None = None) -> Config:
             orb_window_minutes=int(raw["signal"]["orb_window_minutes"]),
             min_bars=int(raw["signal"].get("min_bars", 30)),
             confidence_threshold=float(raw["signal"].get("confidence_threshold", 0.6)),
+            atr_spike_multiplier=float(raw["signal"].get("atr_spike_multiplier", 3.0)),
+            rvol_trend_min=float(raw["signal"].get("rvol_trend_min", 1.5)),
+            rvol_ranging_min=float(raw["signal"].get("rvol_ranging_min", 1.3)),
+            no_trade_windows=raw["signal"].get("no_trade_windows", []),
         ),
         regime=RegimeConfig(
             news_poll_interval_seconds=int(raw["regime"]["news_poll_interval_seconds"]),
@@ -193,7 +218,19 @@ def load_config(config_path: str | None = None) -> Config:
         alpaca_base_url=alpaca_base_url,
         alpaca_data_url=alpaca_data_url,
         groq_api_key=groq_api_key,
+        finnhub_api_key=finnhub_api_key,
+        polygon_api_key=polygon_api_key,
+        oanda_api_key=oanda_api_key,
+        oanda_account_id=oanda_account_id,
     )
+    forex_raw = raw.get("forex", {})
+    if forex_raw:
+        config.forex = ForexConfig(
+            pairs=forex_raw.get("pairs", []),
+            risk_pct=float(forex_raw.get("risk_pct", 0.005)),
+            adx_trend_threshold=float(forex_raw.get("adx_trend_threshold", 25.0)),
+            size_unit=int(forex_raw.get("size_unit", 1000)),
+        )
 
     log.info("Config loaded. NAV=%.0f, tickers=%d", nav, len(tickers))
     return config

@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 
 _asset_cache: dict[str, bool] = {}
 _crypto_stop_orders: dict[str, str] = {}  # ticker -> stop order ID, populated by _submit_crypto_orders
+_equity_stop_orders: dict[str, str] = {}  # ticker -> stop-leg order ID, populated by submit_bracket_order
 
 
 def _price_decimals(price: float) -> int:
@@ -111,6 +112,23 @@ class AlpacaBroker:
         """Return and remove the pending GTC stop order ID for a crypto ticker, if any."""
         return _crypto_stop_orders.pop(ticker, None)
 
+    def pop_equity_stop_order_id(self, ticker: str) -> str | None:
+        """Return and remove the stop-leg order ID for an equity bracket, if any."""
+        return _equity_stop_orders.pop(ticker, None)
+
+    async def update_trailing_stop(self, stop_order_id: str, new_stop: float) -> None:
+        """Move the stop leg of a bracket order to new_stop price."""
+        from alpaca.trading.requests import ReplaceOrderRequest
+        try:
+            await _run_in_executor(
+                self._trading.replace_order_by_id,
+                stop_order_id,
+                ReplaceOrderRequest(stop_price=round(new_stop, 2)),
+            )
+            log.info("Trailing stop updated: order %s → stop=%.2f", stop_order_id, new_stop)
+        except Exception as e:
+            log.warning("Failed to update trailing stop %s: %s", stop_order_id, e)
+
     async def submit_bracket_order(
         self,
         ticker: str,
@@ -143,6 +161,13 @@ class AlpacaBroker:
             "Bracket order submitted: %s %s qty=%d stop=%.2f target=%.2f order_id=%s",
             ticker, side, qty, stop_price, take_profit_price, order.id,
         )
+        if order.legs:
+            for leg in order.legs:
+                leg_type = str(getattr(leg, "type", "") or getattr(leg, "order_type", "")).lower()
+                if "stop" in leg_type and "take" not in leg_type:
+                    _equity_stop_orders[ticker] = str(leg.id)
+                    log.debug("Equity stop leg order ID cached for %s: %s", ticker, leg.id)
+                    break
         return order
 
     async def _submit_crypto_orders(
@@ -288,6 +313,90 @@ class AlpacaBroker:
 
         log.debug("Fetched %d bars for %s", len(df), ticker)
         return df
+
+    async def get_bars_historical(
+        self,
+        ticker: str,
+        timeframe: str,
+        bars: int,
+    ) -> pd.DataFrame:
+        """Fetch historical minute bars using Polygon.io (higher quality, 2y history).
+
+        Falls back to Alpaca's get_bars() if Polygon key is not set or call fails.
+        timeframe: "1Min", "5Min", "1Hour", "1Day" (same format as get_bars).
+
+        Rate limit: Polygon free tier is 5 req/min — callers must throttle.
+        """
+        polygon_key = getattr(self._config, "polygon_api_key", "")
+        if not polygon_key:
+            log.debug("POLYGON_API_KEY not set — falling back to Alpaca for %s", ticker)
+            return self.get_bars(ticker, timeframe, bars)
+
+        # Map timeframe to Polygon multiplier + timespan
+        _tf_map = {
+            "1Min": (1, "minute"),
+            "5Min": (5, "minute"),
+            "1Hour": (1, "hour"),
+            "1Day": (1, "day"),
+        }
+        mult, span = _tf_map.get(timeframe, (1, "minute"))
+
+        try:
+            from polygon import RESTClient
+            from datetime import date, timedelta
+
+            client = RESTClient(polygon_key)
+            end_date = date.today()
+            # Go back far enough to get `bars` trading days of data
+            # (2× for weekends/holidays buffer; 10× for intraday minute bars with gaps)
+            buffer_mult = 2 if span in ("hour", "day") else 10
+            start_date = end_date - timedelta(days=bars * buffer_mult // 390 + 30)
+
+            aggs = list(client.list_aggs(
+                ticker=ticker,
+                multiplier=mult,
+                timespan=span,
+                from_=start_date.isoformat(),
+                to=end_date.isoformat(),
+                limit=bars,
+                sort="asc",
+            ))
+
+            if not aggs:
+                log.debug("Polygon returned no bars for %s — falling back to Alpaca", ticker)
+                return self.get_bars(ticker, timeframe, bars)
+
+            rows = []
+            for a in aggs[-bars:]:
+                rows.append({
+                    "open": float(a.open),
+                    "high": float(a.high),
+                    "low": float(a.low),
+                    "close": float(a.close),
+                    "volume": float(a.volume or 0),
+                    "timestamp": pd.Timestamp(a.timestamp, unit="ms", tz="UTC"),
+                })
+
+            df = pd.DataFrame(rows).set_index("timestamp")
+            df.index = pd.to_datetime(df.index, utc=True)
+            log.debug("Polygon: fetched %d bars for %s", len(df), ticker)
+            return df
+
+        except ImportError:
+            log.debug("polygon-api-client not installed — falling back to Alpaca for %s", ticker)
+            return self.get_bars(ticker, timeframe, bars)
+        except Exception as e:
+            log.warning("Polygon fetch failed for %s: %s — falling back to Alpaca", ticker, e)
+            return self.get_bars(ticker, timeframe, bars)
+
+    def get_market_calendar(self) -> list:
+        """Return Alpaca market calendar entries for today. Empty list = market closed."""
+        from alpaca.trading.requests import GetCalendarRequest
+        from datetime import date
+        today = date.today().isoformat()
+        return self._trading.get_calendar(
+            GetCalendarRequest(start=today, end=today)
+        )
 
     async def is_tradable(self, ticker: str) -> bool:
         """Return True if the asset is active and tradable. Cached per session.

@@ -83,8 +83,8 @@ def vwap_bands(df: pd.DataFrame, deviations: list[float]) -> dict[str, pd.Series
 
     result: dict[str, pd.Series] = {}
     for d in deviations:
-        upper = (vw_mean + d * std).reindex(df.index, method="ffill")
-        lower = (vw_mean - d * std).reindex(df.index, method="ffill")
+        upper = (vw_mean + d * std).reindex(df.index).ffill()
+        lower = (vw_mean - d * std).reindex(df.index).ffill()
         result[f"+{d}"] = upper
         result[f"-{d}"] = lower
     return result
@@ -168,6 +168,9 @@ def orb(df: pd.DataFrame, window_minutes: int = 15) -> tuple[float | None, float
 
     try:
         et = pytz.timezone("America/New_York")
+        if df.index.tz is None:
+            df = df.copy()
+            df.index = df.index.tz_localize("UTC")
         idx_et = df.index.tz_convert(et)
         last_date = idx_et[-1].date()
 

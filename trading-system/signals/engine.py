@@ -6,8 +6,8 @@ and scoring to produce a SignalResult or None per tick.
 
 import asyncio
 import logging
-from dataclasses import dataclass
-from datetime import time as dtime
+from dataclasses import dataclass, replace
+from datetime import datetime, time as dtime
 
 import pytz
 
@@ -97,41 +97,24 @@ class SignalEngine:
         self._config = config
         self._bar_store = bar_store
         self._regime_store = regime_store
+        # Maps ticker -> (last_bar_timestamp, snapshot, confidence)
+        self._indicator_cache: dict[str, tuple[datetime, IndicatorSnapshot, float]] = {}
 
-    def _compute(self, ticker: str, price: float) -> tuple[IndicatorSnapshot, float, RegimeState, float] | None:
-        """Compute indicators and score for a ticker. Returns None if not ready.
-
-        Returns (snapshot, score, regime_state, confidence) or None.
-        """
-        df = self._bar_store.get_bars(ticker, 100)
-
-        # minimum bar guard — must be checked before any indicator calls
-        if len(df) < self._config.signal.min_bars:
-            return None
-
-        regime_state = self._regime_store.get(ticker)
-        if regime_state is None:
-            regime_state = RegimeState(regime="ranging", conviction=2, direction="neutral", catalyst="no regime yet")
-
-        if regime_state.regime == "avoid":
-            return None
-        if regime_state.conviction < self._config.regime.min_conviction_to_trade:
-            return None
-
+    def _compute_indicators(self, ticker: str, df, price: float) -> tuple[IndicatorSnapshot, float] | None:
+        """Compute all indicator values for a ticker. Returns (snapshot, confidence) or None if suppressed."""
         cfg = self._config.signal
 
-        # --- Compute all indicator components, tracking which returned non-None ---
         non_none_count = 0
 
-        ema_series = ema(df, cfg.ema_fast)
-        ema_fast_val = float(ema_series.iloc[-1]) if ema_series is not None else None
-        if ema_fast_val is not None:
-            non_none_count += 1
-
+        ema_fast_series = ema(df, cfg.ema_fast)
         ema_slow_series = ema(df, cfg.ema_slow)
-        ema_slow_val = float(ema_slow_series.iloc[-1]) if ema_slow_series is not None else None
-        # ema_fast and ema_slow are counted as one component (both or neither)
-        # ema is already counted above; ema_slow uses the same slot
+        if ema_fast_series is not None and ema_slow_series is not None:
+            ema_fast_val = float(ema_fast_series.iloc[-1])
+            ema_slow_val = float(ema_slow_series.iloc[-1])
+            non_none_count += 1
+        else:
+            ema_fast_val = None
+            ema_slow_val = None
 
         vwap_series = vwap(df)
         vwap_val = float(vwap_series.iloc[-1]) if vwap_series is not None else None
@@ -146,8 +129,6 @@ class SignalEngine:
         else:
             vwap_std = 0.0
 
-        # Compute band re-entry flags for mean-reversion confirmation.
-        # Requires at least 2 bars and the 2.0-deviation bands to be present.
         prev_close_below_lower_band = False
         current_close_above_lower_band = False
         prev_close_above_upper_band = False
@@ -155,23 +136,34 @@ class SignalEngine:
         if bands is not None and "-2.0" in bands and "+2.0" in bands and len(df) >= 2:
             lower_band_series = bands["-2.0"]
             upper_band_series = bands["+2.0"]
-            # Last two bars' close prices and band values
             prev_close = float(df["close"].iloc[-2])
             curr_close = float(df["close"].iloc[-1])
             lower_prev = float(lower_band_series.iloc[-2])
             lower_curr = float(lower_band_series.iloc[-1])
             upper_prev = float(upper_band_series.iloc[-2])
             upper_curr = float(upper_band_series.iloc[-1])
-            # Long re-entry: prev bar closed below -2.0 band, current bar closed above it
             prev_close_below_lower_band = prev_close < lower_prev
             current_close_above_lower_band = curr_close > lower_curr
-            # Short re-entry: prev bar closed above +2.0 band, current bar closed below it
             prev_close_above_upper_band = prev_close > upper_prev
             current_close_below_upper_band = curr_close < upper_curr
 
         atr_val = atr(df, cfg.atr_period)
         if atr_val is not None:
             non_none_count += 1
+
+        # Suppress signal if current ATR is spiking far above its recent baseline.
+        if atr_val is not None and len(df) >= 40:
+            atr_baseline = atr(df.iloc[-40:-20], cfg.atr_period)
+            try:
+                atr_spike_mult = float(getattr(cfg, "atr_spike_multiplier", 3.0))
+            except (TypeError, ValueError):
+                atr_spike_mult = 3.0
+            if atr_baseline is not None and atr_baseline > 0 and atr_val > atr_spike_mult * atr_baseline:
+                log.info(
+                    "%s: ATR spike detected (%.4f > %.1fx %.4f) — signal suppressed",
+                    ticker, atr_val, atr_spike_mult, atr_baseline,
+                )
+                return None
 
         rsi_val = rsi(df, cfg.rsi_period)
         if rsi_val is not None:
@@ -182,7 +174,6 @@ class SignalEngine:
             non_none_count += 1
 
         rvol_val = rvol(df)
-        # rvol always returns a float (defaults to 1.0), so always count it
         non_none_count += 1
 
         orb_high, orb_low = _resolve_orb(ticker, df, atr_val, cfg.orb_window_minutes)
@@ -201,15 +192,12 @@ class SignalEngine:
             log.debug("%s: confidence %.2f below threshold %.2f — signal suppressed", ticker, confidence, confidence_threshold)
             return None
 
-        # Substitute safe defaults for None values so IndicatorSnapshot can be constructed.
-        # These don't affect scoring since compute_score handles None orb and the scorer
-        # reads ema_fast/ema_slow/vwap/rsi/macd_line/macd_signal as scalars.
-        snapshot = IndicatorSnapshot(
+        snap = IndicatorSnapshot(
             ema_fast=ema_fast_val if ema_fast_val is not None else price,
             ema_slow=ema_slow_val if ema_slow_val is not None else price,
             vwap=vwap_val if vwap_val is not None else price,
             current_price=price,
-            rsi=rsi_val if rsi_val is not None else 50.0,
+            rsi=rsi_val,
             macd_line=macd_line if macd_line is not None else 0.0,
             macd_signal=macd_signal if macd_signal is not None else 0.0,
             rvol=rvol_val,
@@ -222,12 +210,55 @@ class SignalEngine:
             prev_close_above_upper_band=prev_close_above_upper_band,
             current_close_below_upper_band=current_close_below_upper_band,
         )
+        return snap, confidence
 
-        score = compute_score(snapshot, regime_state)
+    def _compute(self, ticker: str, price: float) -> tuple[IndicatorSnapshot, float, RegimeState, float] | None:
+        """Compute indicators and score for a ticker. Returns None if not ready.
+
+        Returns (snapshot, score, regime_state, confidence) or None.
+        """
+        df = self._bar_store.get_bars(ticker, 100)
+
+        # minimum bar guard — must be checked before any indicator calls
+        if len(df) < self._config.signal.min_bars:
+            return None
+
+        regime_state = self._regime_store.get(ticker)
+        if regime_state is None:
+            min_conv = self._config.regime.min_conviction_to_trade
+            regime_state = RegimeState(regime="ranging", conviction=min_conv, direction="neutral", catalyst="no regime yet")
+            log.debug("%s: no regime classification yet — using fallback ranging/conviction=%d", ticker, min_conv)
+
+        if regime_state.regime == "avoid":
+            return None
+        if regime_state.conviction < self._config.regime.min_conviction_to_trade:
+            log.debug("%s: conviction=%d below min=%d — signal suppressed", ticker, regime_state.conviction, self._config.regime.min_conviction_to_trade)
+            return None
+
+        last_bar_ts = df.index[-1]
+        if ticker in self._indicator_cache:
+            cached_ts, cached_snap, cached_confidence = self._indicator_cache[ticker]
+            if cached_ts == last_bar_ts:
+                snap = replace(cached_snap, current_price=price)
+                confidence = cached_confidence
+            else:
+                result = self._compute_indicators(ticker, df, price)
+                if result is None:
+                    return None
+                snap, confidence = result
+                self._indicator_cache[ticker] = (last_bar_ts, snap, confidence)
+        else:
+            result = self._compute_indicators(ticker, df, price)
+            if result is None:
+                return None
+            snap, confidence = result
+            self._indicator_cache[ticker] = (last_bar_ts, snap, confidence)
+
+        score = compute_score(snap, regime_state)
         if score is None:
             return None
 
-        return snapshot, score, regime_state, confidence
+        return snap, score, regime_state, confidence
 
     def get_bars(self, ticker: str, n: int):
         """Public accessor for bar data. Delegates to _bar_store."""
@@ -294,9 +325,11 @@ class SignalEngine:
             snapshot, score, regime_state, confidence = result
             cfg = self._config.signal
             log.info(
-                "%s score=%.3f confidence=%.2f rsi=%.1f rvol=%.2f vwap=%.2f price=%.2f vwap_std=%.4f "
+                "%s score=%.3f confidence=%.2f rsi=%s rvol=%.2f vwap=%.2f price=%.2f vwap_std=%.4f "
                 "ema_fast=%.2f ema_slow=%.2f regime=%s conviction=%d threshold=%.2f",
-                ticker, score, confidence, snapshot.rsi, snapshot.rvol, snapshot.vwap, price, snapshot.vwap_std,
+                ticker, score, confidence,
+                "%.1f" % snapshot.rsi if snapshot.rsi is not None else "None",
+                snapshot.rvol, snapshot.vwap, price, snapshot.vwap_std,
                 snapshot.ema_fast, snapshot.ema_slow,
                 regime_state.regime, regime_state.conviction, cfg.entry_threshold,
             )

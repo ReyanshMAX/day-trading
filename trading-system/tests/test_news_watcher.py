@@ -3,6 +3,8 @@
 Mocks _fetch_headlines and RegimeClassifier. Tests hash deduplication.
 """
 
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,6 +30,8 @@ def make_watcher(config, classifier, regime_store, fetch_side_effect=None):
     watcher._regime_store = regime_store
     watcher._news_client = MagicMock()
     watcher._hashes = {t: set() for t in config.universe.tickers}
+    watcher._hash_timestamps = {t: {} for t in config.universe.tickers}
+    watcher._sem = asyncio.Semaphore(5)
     if fetch_side_effect is not None:
         watcher._fetch_headlines = AsyncMock(side_effect=fetch_side_effect)
     return watcher

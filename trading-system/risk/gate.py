@@ -27,8 +27,9 @@ def check(
     stop_distance: float,
     portfolio: Portfolio,
     config: Config,
+    atr: float = 0.0,
 ) -> GateResult:
-    """Run all five risk checks in order. Returns GateResult.
+    """Run all six risk checks in order. Returns GateResult.
 
     Pure function — no side effects. If the daily loss limit is newly breached,
     set_loss_limit=True is returned so the caller can apply the mutation.
@@ -60,7 +61,14 @@ def check(
 
     # 4. Trade risk
     trade_risk = qty * stop_distance
-    if portfolio.nav > 0 and (trade_risk / portfolio.nav) > config.risk.max_trade_risk_pct:
+    # Guard: non-positive NAV means we cannot safely size any trade
+    if portfolio.nav <= 0:
+        log.warning(
+            "%s | %s | REJECT: NAV is non-positive (%.2f) — trading halted",
+            now, ticker, portfolio.nav,
+        )
+        return GateResult(approved=False, reason="NAV is non-positive — trading halted")
+    if (trade_risk / portfolio.nav) > config.risk.max_trade_risk_pct:
         log.info(
             "%s | %s | REJECT: trade risk %.2f%% > %.0f%%",
             now, ticker, (trade_risk / portfolio.nav) * 100, config.risk.max_trade_risk_pct * 100,
@@ -75,6 +83,14 @@ def check(
             now, ticker, sector, config.risk.max_sector_positions,
         )
         return GateResult(approved=False, reason="sector concentration")
+
+    # 6. Short stop width guard
+    if direction == "short" and atr > 0 and stop_distance > 2.0 * atr:
+        log.info(
+            "%s | %s | REJECT: short stop too wide — stop_dist=%.4f > 2x ATR=%.4f",
+            now, ticker, stop_distance, atr,
+        )
+        return GateResult(approved=False, reason="short stop too wide")
 
     log.info("%s | %s | APPROVE: direction=%s qty=%d stop_dist=%.2f", now, ticker, direction, qty, stop_distance)
     return GateResult(approved=True, reason=None)

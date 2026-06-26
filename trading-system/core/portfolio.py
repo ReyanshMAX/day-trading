@@ -16,8 +16,6 @@ SECTOR_MAP: dict[str, str] = {
     "TSLA": "consumer", "COIN": "crypto", "MSTR": "crypto",
     "PLTR": "tech", "SOFI": "finance", "ARKK": "etf",
     "SPY": "broad_market", "QQQ": "tech_etf",
-    "BTC/USD": "crypto", "ETH/USD": "crypto",
-    "SOL/USD": "crypto"
 }
 
 
@@ -91,6 +89,12 @@ class Portfolio:
                 "possible untracked position or manual intervention",
                 symbol,
             )
+
+    def reset_daily(self) -> None:
+        """Reset daily P&L and loss limit flag at the start of each trading day."""
+        self.daily_pnl = 0.0
+        self.daily_loss_limit_hit = False
+        log.info("Daily P&L and loss limit flag reset")
 
     def record_fill(self, order, stop: float = 0.0, target: float = 0.0, entry_price: float = 0.0, stop_order_id: str | None = None, entry_time: datetime | None = None, atr: float = 0.0) -> None:
         """Record a new position from an order fill.

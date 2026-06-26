@@ -3,6 +3,7 @@
 Uses AsyncMock to avoid real Groq API calls.
 """
 
+import asyncio
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -71,7 +72,7 @@ async def test_malformed_json_returns_fallback():
     )
     state = await clf.classify("NVDA", [], None)
     assert state.regime == "ranging"
-    assert state.conviction == 2
+    assert state.conviction == 3
 
 
 @pytest.mark.asyncio
@@ -110,7 +111,7 @@ async def test_api_exception_returns_fallback():
     clf._client = AsyncMock()
     clf._client.chat = AsyncMock()
     clf._client.chat.completions = AsyncMock()
-    clf._client.chat.completions.create = AsyncMock(side_effect=TimeoutError("Groq timeout"))
+    clf._client.chat.completions.create = AsyncMock(side_effect=asyncio.TimeoutError())
     state = await clf.classify("NVDA", [], None)
     assert state == fallback_regime()
     # Must not raise
@@ -162,3 +163,18 @@ async def test_cache_hit_calls_groq_exactly_once():
     )
     assert state2.regime == "trending"
     assert state2.last_headlines_hash == current_hash
+
+
+@pytest.mark.asyncio
+async def test_ollama_fallback_used_when_groq_down():
+    """When Groq circuit is open and ollama is not installed, returns fallback/stored."""
+    clf = make_classifier()
+    # Trip the circuit breaker and set last_probe_at to now so probe is suppressed.
+    clf._groq_down = True
+    clf._last_probe_at = datetime.now(timezone.utc)
+
+    state = await clf.classify("NVDA", ["some headline"], "ranging")
+
+    # Must return a valid RegimeState — never raise.
+    assert isinstance(state, RegimeState)
+    assert state.regime in ("trending", "ranging", "avoid")

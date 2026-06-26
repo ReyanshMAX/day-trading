@@ -11,13 +11,38 @@ from datetime import datetime
 log = logging.getLogger(__name__)
 
 
+def _rsi_trend_score(rsi: float | None) -> float | None:
+    if rsi is None:
+        return None
+    if rsi >= 70:
+        return 1.0
+    if rsi >= 50:
+        return (rsi - 50) / 20        # 0.0 at RSI=50, 1.0 at RSI=70
+    if rsi >= 40:
+        return (rsi - 40) / 10 * 0.5  # 0.0 at RSI=40, 0.5 at RSI=50
+    return 0.0
+
+
+def _rsi_trend_score_short(rsi: float | None) -> float | None:
+    """Inverted RSI for trending short (overbought favors short)."""
+    if rsi is None:
+        return None
+    if rsi <= 30:
+        return 1.0
+    if rsi <= 50:
+        return (50 - rsi) / 20
+    if rsi <= 60:
+        return (60 - rsi) / 10 * 0.5
+    return 0.0
+
+
 @dataclass
 class IndicatorSnapshot:
     ema_fast: float
     ema_slow: float
     vwap: float
     current_price: float
-    rsi: float
+    rsi: float | None
     macd_line: float
     macd_signal: float
     rvol: float
@@ -58,6 +83,9 @@ def compute_score(
         score = _score_trending(indicators, regime)
     elif regime.regime == "ranging":
         score = _score_ranging(indicators, regime)
+        if score is None:
+            log.debug("compute_score: ranging hard gate rejected (regime=%s direction=%s)", regime.regime, regime.direction)
+            return None
     else:
         log.warning("Unknown regime '%s', returning 0.0", regime.regime)
         score = 0.0
@@ -98,31 +126,48 @@ def _score_trending(indicators: IndicatorSnapshot, regime: RegimeState) -> float
 
     Weights (sum to 1.0 when all present):
         ema_trend=0.25, vwap_pos=0.20, orb=0.15, macd=0.15, rsi=0.10, rvol=0.15
+
+    For bearish direction, indicator conditions are inverted so a strong bearish
+    setup scores near 1.0 before negation (not 0.0). This means shorts fire with
+    the same strength as longs in equivalent bearish setups.
     """
-    # ORB is None when pre-market or window not elapsed — excluded from sum.
-    orb_value: float | None = None
-    if indicators.orb_high is not None:
-        orb_value = 1.0 if indicators.current_price > indicators.orb_high else 0.0
+    is_short = regime.direction == "bearish"
 
-    pairs: list[tuple[float, float | None]] = [
-        (0.25, 1.0 if indicators.ema_fast > indicators.ema_slow else 0.0),
-        (0.20, 1.0 if indicators.current_price > indicators.vwap else 0.0),
-        (0.15, orb_value),
-        (0.15, 1.0 if indicators.macd_line > indicators.macd_signal else 0.0),
-        (0.10, 1.0 if 40 < indicators.rsi < 70 else 0.0),
-        (0.15, 1.0 if indicators.rvol > 1.5 else 0.0),
-    ]
+    if is_short:
+        # ORB: price below orb_low = bearish breakout confirmation
+        orb_value: float | None = None
+        if indicators.orb_low is not None:
+            orb_value = 1.0 if indicators.current_price < indicators.orb_low else 0.0
 
-    raw_score = _weighted_sum(pairs)
+        pairs: list[tuple[float, float | None]] = [
+            (0.25, 1.0 if indicators.ema_fast < indicators.ema_slow else 0.0),
+            (0.20, 1.0 if indicators.current_price < indicators.vwap else 0.0),
+            (0.15, orb_value),
+            (0.15, 1.0 if indicators.macd_line < indicators.macd_signal else 0.0),
+            (0.10, _rsi_trend_score_short(indicators.rsi)),
+            (0.15, 1.0 if indicators.rvol > 1.5 else 0.0),
+        ]
+        raw_score = _weighted_sum(pairs)
+        return max(-1.0, min(1.0, -raw_score))
+    else:
+        # ORB: price above orb_high = bullish breakout confirmation
+        orb_value = None
+        if indicators.orb_high is not None:
+            orb_value = 1.0 if indicators.current_price > indicators.orb_high else 0.0
 
-    # Apply direction: regime says bearish → negate
-    if regime.direction == "bearish":
-        raw_score = -raw_score
+        pairs = [
+            (0.25, 1.0 if indicators.ema_fast > indicators.ema_slow else 0.0),
+            (0.20, 1.0 if indicators.current_price > indicators.vwap else 0.0),
+            (0.15, orb_value),
+            (0.15, 1.0 if indicators.macd_line > indicators.macd_signal else 0.0),
+            (0.10, _rsi_trend_score(indicators.rsi)),
+            (0.15, 1.0 if indicators.rvol > 1.5 else 0.0),
+        ]
+        raw_score = _weighted_sum(pairs)
+        return max(-1.0, min(1.0, raw_score))
 
-    return max(-1.0, min(1.0, raw_score))
 
-
-def _score_ranging(indicators: IndicatorSnapshot, regime: RegimeState) -> float:
+def _score_ranging(indicators: IndicatorSnapshot, regime: RegimeState) -> float | None:
     """Ranging regime scoring — mean reversion bias.
 
     Bullish/neutral: score long-bias conditions (oversold).
@@ -133,18 +178,29 @@ def _score_ranging(indicators: IndicatorSnapshot, regime: RegimeState) -> float:
     """
     if regime.direction == "bearish":
         raw_score = _score_ranging_short(indicators)
+        if raw_score is None:
+            return None
         return max(-1.0, min(1.0, -raw_score))
     else:
         raw_score = _score_ranging_long(indicators)
+        if raw_score is None:
+            return None
         return max(-1.0, min(1.0, raw_score))
 
 
-def _score_ranging_long(indicators: IndicatorSnapshot) -> float:
+def _score_ranging_long(indicators: IndicatorSnapshot) -> float | None:
     """Long-bias ranging score (mean reversion from oversold).
 
     VWAP band component fires only when price has re-entered the -2.0 band:
     previous bar was below the -2.0 band AND current bar is above it.
     """
+    # Hard gate: require oversold RSI confirmation — without it, no ranging long entry
+    if indicators.rsi is None or indicators.rsi >= 40:
+        return None
+    # Volume confirmation
+    if indicators.rvol < 1.3:
+        return None
+
     # vwap_band: None when vwap_std is unavailable (zero → no std computed yet)
     # Use the -2.0 standard deviation band (not -1.0) as the trigger threshold.
     # Additionally require band re-entry confirmation: prev bar below, current bar above.
@@ -167,18 +223,25 @@ def _score_ranging_long(indicators: IndicatorSnapshot) -> float:
         (0.35, vwap_band_value),
         (0.25, 1.0 if indicators.rsi < 35 else 0.0),
         (0.20, orb_prox_value),
-        (0.20, 1.0 if indicators.rvol > 1.2 else 0.0),
+        (0.20, 1.0 if indicators.rvol > 1.3 else 0.0),
     ]
 
     return _weighted_sum(pairs)
 
 
-def _score_ranging_short(indicators: IndicatorSnapshot) -> float:
+def _score_ranging_short(indicators: IndicatorSnapshot) -> float | None:
     """Short-bias ranging score (mean reversion from overbought).
 
     VWAP band component fires only when price has re-entered the +2.0 band:
     previous bar was above the +2.0 band AND current bar is back below it.
     """
+    # Hard gate: require overbought RSI confirmation — without it, no ranging short entry
+    if indicators.rsi is None or indicators.rsi <= 60:
+        return None
+    # Volume confirmation
+    if indicators.rvol < 1.3:
+        return None
+
     # vwap_band: None when vwap_std is unavailable
     # Use the +2.0 standard deviation band (not +1.0) as the trigger threshold.
     # Additionally require band re-entry confirmation: prev bar above, current bar below.
@@ -201,7 +264,7 @@ def _score_ranging_short(indicators: IndicatorSnapshot) -> float:
         (0.35, vwap_band_value),
         (0.25, 1.0 if indicators.rsi > 65 else 0.0),
         (0.20, orb_prox_value),
-        (0.20, 1.0 if indicators.rvol > 1.2 else 0.0),
+        (0.20, 1.0 if indicators.rvol > 1.3 else 0.0),
     ]
 
     return _weighted_sum(pairs)

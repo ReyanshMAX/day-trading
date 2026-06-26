@@ -1,8 +1,7 @@
 """Alpaca WebSocket tick stream with exponential backoff reconnect.
 
 Single responsibility: subscribe to live trade ticks and forward them to
-the executor callback. Equity tickers use Alpaca IEX WebSocket; crypto
-tickers are routed to Binance's public aggTrade stream (see binance_stream.py).
+the executor callback. Uses Alpaca IEX WebSocket for equities.
 Also runs a TradingStream for order update events so hard stop fills are
 detected via push rather than polling.
 """
@@ -16,15 +15,9 @@ from alpaca.data import DataFeed
 from alpaca.data.live import StockDataStream
 from alpaca.trading.stream import TradingStream
 
-from core import coinbase_stream
-
 log = logging.getLogger(__name__)
 
 _MAX_RETRIES = 5
-
-
-def _is_crypto(ticker: str) -> bool:
-    return "/" in ticker or (ticker.endswith("USD") and len(ticker) > 4)
 
 
 async def _run_equity_stream(
@@ -56,7 +49,13 @@ async def _run_equity_stream(
             await stream._run_forever()
         except Exception as e:
             retries += 1
-            wait = 2 ** retries
+            # "connection limit exceeded" means Alpaca still has a prior session
+            # open — a short retry delay just triggers the same error repeatedly.
+            # Give Alpaca 30 s to expire the old connection before re-attempting.
+            if "connection limit" in str(e).lower():
+                wait = 30
+            else:
+                wait = 5 * (2 ** retries)
             log.error(
                 "Equity stream disconnected: %s. Retrying in %ds (%d/%d)",
                 e, wait, retries, _MAX_RETRIES,
@@ -76,6 +75,7 @@ async def _run_trading_stream(
     secret_key: str,
     portfolio: Any,
     on_reconnect: Callable[[], Any] | None = None,
+    paper: bool = True,
 ) -> None:
     """Subscribe to Alpaca order update events via TradingStream.
 
@@ -120,14 +120,17 @@ async def _run_trading_stream(
     while retries < _MAX_RETRIES:
         ts = None
         try:
-            ts = TradingStream(api_key, secret_key, paper=True)
+            ts = TradingStream(api_key, secret_key, paper=paper)
             ts.subscribe_trade_updates(on_trade_update)
             log.info("TradingStream connected — listening for order fill events")
             retries = 0
             await ts._run_forever()
         except Exception as e:
             retries += 1
-            wait = 2 ** retries
+            if "connection limit" in str(e).lower():
+                wait = 30
+            else:
+                wait = 5 * (2 ** retries)
             log.error(
                 "TradingStream disconnected: %s. Retrying in %ds (%d/%d)",
                 e, wait, retries, _MAX_RETRIES,
@@ -154,30 +157,21 @@ async def start(
     secret_key: str = "",
     portfolio: Any = None,
     on_reconnect: Callable[[], Any] | None = None,
+    paper: bool = True,
 ) -> None:
-    """Subscribe to live trade ticks for all tickers.
-
-    Equities → Alpaca IEX WebSocket.
-    Crypto   → Binance public aggTrade WebSocket (no API key, lower latency).
-    Both feed into the same on_tick_callback signature.
+    """Subscribe to live trade ticks for all tickers via Alpaca IEX WebSocket.
 
     Also starts a TradingStream to detect hard stop fills via push events.
     Pass portfolio and an optional on_reconnect callback; if omitted the
     TradingStream is not started (backwards-compatible for tests/smoke runs).
     """
-    equity_tickers = [t for t in tickers if not _is_crypto(t)]
-    crypto_tickers = [t for t in tickers if _is_crypto(t)]
-
     tasks = []
 
-    if equity_tickers:
-        tasks.append(_run_equity_stream(api_key, secret_key, equity_tickers, on_tick_callback))
-
-    if crypto_tickers:
-        tasks.append(coinbase_stream.start(crypto_tickers, on_tick_callback))
+    if tickers:
+        tasks.append(_run_equity_stream(api_key, secret_key, tickers, on_tick_callback))
 
     if portfolio is not None and api_key:
-        tasks.append(_run_trading_stream(api_key, secret_key, portfolio, on_reconnect))
+        tasks.append(_run_trading_stream(api_key, secret_key, portfolio, on_reconnect, paper=paper))
 
     if not tasks:
         log.error("No tickers to subscribe to.")

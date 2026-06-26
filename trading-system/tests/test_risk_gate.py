@@ -106,6 +106,13 @@ def test_approve_all_clear():
     assert result.reason is None
 
 
+def test_reject_non_positive_nav():
+    portfolio = make_portfolio(nav=-1000.0)
+    result = check("NVDA", "long", 10, 1.0, portfolio, make_config())
+    assert not result.approved
+    assert "NAV" in result.reason
+
+
 def test_gate_does_not_mutate_portfolio_on_rejection():
     portfolio = make_portfolio()
     portfolio.daily_loss_limit_hit = True
@@ -114,3 +121,35 @@ def test_gate_does_not_mutate_portfolio_on_rejection():
     check("NVDA", "long", 10, 1.0, portfolio, make_config())
     assert portfolio.positions == positions_before
     assert portfolio.daily_pnl == pnl_before
+
+
+def test_reject_short_stop_too_wide():
+    portfolio = make_portfolio()
+    # atr=2.0, stop_distance=5.0 → 5.0 > 2 * 2.0 → reject
+    result = check("NVDA", "short", 10, 5.0, portfolio, make_config(), atr=2.0)
+    assert not result.approved
+    assert result.reason == "short stop too wide"
+
+
+def test_approve_short_stop_within_limit():
+    portfolio = make_portfolio()
+    # atr=2.0, stop_distance=3.9 → 3.9 < 2 * 2.0 = 4.0 → approve
+    result = check("NVDA", "short", 10, 3.9, portfolio, make_config(), atr=2.0)
+    assert result.approved
+
+
+def test_short_stop_guard_skipped_when_atr_zero():
+    portfolio = make_portfolio()
+    # atr=0 → guard disabled regardless of stop_distance
+    result = check("NVDA", "short", 10, 999.0, portfolio, make_config(), atr=0.0)
+    # Only blocked by trade risk (999*10=9990 > 1% of 100k), not by stop guard
+    assert not result.approved
+    assert result.reason == "trade risk"
+
+
+def test_short_stop_guard_not_applied_to_long():
+    portfolio = make_portfolio()
+    # Long trade with very wide stop — should not trigger the short guard
+    # qty=1, stop_distance=0.5 → trade_risk=0.5 < 1% of 100k → approved
+    result = check("NVDA", "long", 1, 0.5, portfolio, make_config(), atr=0.1)
+    assert result.approved

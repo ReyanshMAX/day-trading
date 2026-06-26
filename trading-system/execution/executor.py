@@ -7,12 +7,14 @@ build bracket, and submit order. All dependencies are injected.
 import asyncio
 import logging
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from core.broker import AlpacaBroker
 from core.config import Config
 from core.order_manager import OrderManager
 from core.portfolio import Portfolio
+from core.trade_journal import TradeJournal
 from memory.chroma_store import ChromaStore
 from signals.engine import SignalEngine
 from signals.indicators import fibonacci_levels, detect_swing_high, detect_swing_low
@@ -32,6 +34,7 @@ class Executor:
         risk_gate,
         config: Config,
         chroma_store: ChromaStore | None = None,
+        journal: TradeJournal | None = None,
     ) -> None:
         self._broker = broker
         self._portfolio = portfolio
@@ -40,13 +43,19 @@ class Executor:
         self._risk_gate = risk_gate  # callable: (ticker, direction, qty, stop_distance, portfolio, config) -> GateResult
         self._config = config
         self._chroma = chroma_store
+        self._journal = journal
+        self._open_trade_ids: dict[str, int] = {}
         # Cache populated by refresh_asset_cache() background coroutine.
         # Defaults to True (tradable) when a ticker has not yet been evaluated
         # so that early ticks are not silently dropped before the first refresh.
         self._asset_tradable_cache: dict[str, bool] = {}
+        self._exit_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-    def _record_close_and_update_chroma(self, close_order, ticker: str) -> None:
-        """Call record_close and, if pnl_pct is available, update ChromaDB outcome."""
+    def _record_close_and_update_chroma(self, close_order, ticker: str) -> float | None:
+        """Call record_close and, if pnl_pct is available, update ChromaDB outcome.
+
+        Returns pnl_pct so async callers can forward it to the journal.
+        """
         pnl_pct = self._portfolio.record_close(close_order)
         if self._chroma is not None and pnl_pct is not None:
             date_str = datetime.now(timezone.utc).date().isoformat()
@@ -54,6 +63,19 @@ class Executor:
                 self._chroma.update_outcome(ticker, date_str, pnl_pct)
             except Exception as e:
                 log.error("update_outcome failed for %s: %s", ticker, e)
+        return pnl_pct
+
+    def _schedule_journal_exit(self, ticker: str, close_order, pnl_pct: float | None, reason: str) -> None:
+        """Fire-and-forget: schedule a journal exit record as a background task."""
+        if self._journal is None:
+            return
+        trade_id = self._open_trade_ids.pop(ticker, None)
+        if trade_id is None:
+            return
+        exit_price = float(getattr(close_order, "filled_avg_price", None) or 0.0)
+        asyncio.create_task(
+            self._journal.record_exit(trade_id, exit_price, reason, pnl_pct=pnl_pct)
+        )
 
     async def refresh_asset_cache(self) -> None:
         """Background coroutine: refresh tradability for all config tickers."""
@@ -122,75 +144,112 @@ class Executor:
                         (pos.side == "short" and price <= pos.current_soft_target)
                     )
                     if hit_target:
-                        # Guard: re-check atomically. If the hard stop already
-                        # filled via TradingStream, has_position returns False
-                        # and we skip the redundant market close.
-                        if not self._portfolio.has_position(ticker):
-                            log.info(
-                                "Soft take-profit skipped for %s: position already closed (hard stop filled)",
-                                ticker,
-                            )
-                            return
-                        log.info(
-                            "Soft take-profit triggered for %s: price=%.5f soft_target=%.5f — closing position",
-                            ticker, price, pos.current_soft_target,
-                        )
-                        try:
-                            # Cancel the live GTC stop-loss order before submitting
-                            # the market close, otherwise Alpaca will try to execute
-                            # both and may open an unintended short after the position
-                            # is already gone.
-                            if pos.stop_order_id:
-                                try:
-                                    await self._broker.cancel_order(pos.stop_order_id)
-                                    log.info(
-                                        "Cancelled stop-loss order %s for %s before soft take-profit close",
-                                        pos.stop_order_id, ticker,
-                                    )
-                                except Exception as cancel_err:
-                                    log.error(
-                                        "Failed to cancel stop-loss order %s for %s: %s",
-                                        pos.stop_order_id, ticker, cancel_err,
-                                    )
-                            # Atomically re-check: hard stop may have filled while
-                            # we were awaiting cancel_order above.
+                        async with self._exit_locks[ticker]:
+                            # Guard: re-check atomically. If the hard stop already
+                            # filled via TradingStream, has_position returns False
+                            # and we skip the redundant market close.
                             if not self._portfolio.has_position(ticker):
                                 log.info(
-                                    "Soft take-profit skipped for %s: position closed during cancel_order await",
+                                    "Soft take-profit skipped for %s: position already closed (hard stop filled)",
                                     ticker,
                                 )
                                 return
-                            close_side = "sell" if pos.side == "long" else "buy"
-                            # Submit market close with one retry on failure.
+                            log.info(
+                                "Soft take-profit triggered for %s: price=%.5f soft_target=%.5f — closing position",
+                                ticker, price, pos.current_soft_target,
+                            )
                             try:
-                                close_order = await self._broker.submit_market_order(
-                                    ticker, pos.qty, close_side
-                                )
-                                self._record_close_and_update_chroma(close_order, ticker)
-                            except Exception as first_err:
-                                retry_sleep = self._config.execution.order_retry_sleep_seconds
-                                log.error(
-                                    "Soft take-profit close failed for %s (attempt 1/2): %s — retrying in %.1fs",
-                                    ticker, first_err, retry_sleep,
-                                )
-                                await asyncio.sleep(retry_sleep)
+                                # Cancel the live GTC stop-loss order before submitting
+                                # the market close, otherwise Alpaca will try to execute
+                                # both and may open an unintended short after the position
+                                # is already gone.
+                                if pos.stop_order_id:
+                                    try:
+                                        await self._broker.cancel_order(pos.stop_order_id)
+                                        log.info(
+                                            "Cancelled stop-loss order %s for %s before soft take-profit close",
+                                            pos.stop_order_id, ticker,
+                                        )
+                                    except Exception as cancel_err:
+                                        log.error(
+                                            "Failed to cancel stop-loss order %s for %s: %s",
+                                            pos.stop_order_id, ticker, cancel_err,
+                                        )
+                                # Atomically re-check: hard stop may have filled while
+                                # we were awaiting cancel_order above.
+                                if not self._portfolio.has_position(ticker):
+                                    log.info(
+                                        "Soft take-profit skipped for %s: position closed during cancel_order await",
+                                        ticker,
+                                    )
+                                    return
+                                close_side = "sell" if pos.side == "long" else "buy"
+                                # Submit market close with one retry on failure.
                                 try:
                                     close_order = await self._broker.submit_market_order(
                                         ticker, pos.qty, close_side
                                     )
-                                    self._record_close_and_update_chroma(close_order, ticker)
-                                except Exception as second_err:
-                                    log.critical(
-                                        "Soft take-profit close FAILED after 2 attempts for %s: %s "
-                                        "| position state: side=%s qty=%.4f entry=%.4f "
-                                        "stop=%.4f soft_target=%.4f — position left open",
-                                        ticker, second_err,
-                                        pos.side, pos.qty, pos.avg_entry,
-                                        pos.stop, pos.current_soft_target,
+                                    _pnl_pct = self._record_close_and_update_chroma(close_order, ticker)
+                                    self._schedule_journal_exit(ticker, close_order, _pnl_pct, "soft_take_profit")
+                                except Exception as first_err:
+                                    retry_sleep = self._config.execution.order_retry_sleep_seconds
+                                    log.error(
+                                        "Soft take-profit close failed for %s (attempt 1/2): %s — retrying in %.1fs",
+                                        ticker, first_err, retry_sleep,
                                     )
-                        except Exception as tp_err:
-                            log.error("Soft take-profit close failed for %s: %s", ticker, tp_err)
+                                    await asyncio.sleep(retry_sleep)
+                                    try:
+                                        close_order = await self._broker.submit_market_order(
+                                            ticker, pos.qty, close_side
+                                        )
+                                        _pnl_pct = self._record_close_and_update_chroma(close_order, ticker)
+                                        self._schedule_journal_exit(ticker, close_order, _pnl_pct, "soft_take_profit")
+                                    except Exception as second_err:
+                                        log.critical(
+                                            "Soft take-profit close FAILED after 2 attempts for %s: %s "
+                                            "| position state: side=%s qty=%.4f entry=%.4f "
+                                            "stop=%.4f soft_target=%.4f — position left open",
+                                            ticker, second_err,
+                                            pos.side, pos.qty, pos.avg_entry,
+                                            pos.stop, pos.current_soft_target,
+                                        )
+                            except Exception as tp_err:
+                                log.error("Soft take-profit close failed for %s: %s", ticker, tp_err)
+                            return
+
+            # Time-of-day filter — only apply to equities during restricted windows
+            _is_equity = not _is_crypto
+            if _is_equity:
+                from datetime import time as _time
+                from zoneinfo import ZoneInfo
+                now_et = datetime.now(tz=ZoneInfo("America/New_York")).time()
+                for window in self._config.signal.no_trade_windows:
+                    w_start = _time.fromisoformat(window[0])
+                    w_end = _time.fromisoformat(window[1])
+                    if w_start <= now_et < w_end:
                         return
+
+            # Equity trailing stop — move stop to breakeven then trail by 1× ATR
+            if _is_equity:
+                _positions = getattr(self._portfolio, "positions", None)
+                pos = _positions.get(ticker) if _positions is not None else None
+                if pos is not None and pos.stop_order_id and pos.atr > 0:
+                    if pos.side == "long":
+                        breakeven_trigger = pos.avg_entry + pos.atr
+                        trail_stop = price - pos.atr
+                        if price >= breakeven_trigger and trail_stop > pos.stop:
+                            await self._broker.update_trailing_stop(pos.stop_order_id, trail_stop)
+                            pos.stop = trail_stop
+                            log.info("%s: trailing stop moved to %.2f (price=%.2f atr=%.4f)",
+                                     ticker, trail_stop, price, pos.atr)
+                    else:  # short
+                        breakeven_trigger = pos.avg_entry - pos.atr
+                        trail_stop = price + pos.atr
+                        if price <= breakeven_trigger and trail_stop < pos.stop:
+                            await self._broker.update_trailing_stop(pos.stop_order_id, trail_stop)
+                            pos.stop = trail_stop
+                            log.info("%s: trailing stop moved to %.2f (price=%.2f atr=%.4f)",
+                                     ticker, trail_stop, price, pos.atr)
 
             # 1. Skip if already in position (before running signal engine for efficiency)
             if self._portfolio.has_position(ticker):
@@ -236,6 +295,7 @@ class Executor:
                 bracket.stop_distance,
                 self._portfolio,
                 self._config,
+                atr=signal.atr,
             )
             if gate.set_loss_limit:
                 self._portfolio.daily_loss_limit_hit = True
@@ -267,9 +327,10 @@ class Executor:
                 bracket.stop,
                 bracket.target,
             )
-            # For crypto, retrieve the stop order ID stashed by broker so we can
-            # cancel it later when the soft take-profit fires.
-            stop_order_id = self._broker.pop_crypto_stop_order_id(ticker) if _is_crypto else None
+            stop_order_id = (
+                self._broker.pop_crypto_stop_order_id(ticker) if _is_crypto
+                else self._broker.pop_equity_stop_order_id(ticker)
+            )
             self._portfolio.record_fill(
                 order,
                 stop=bracket.stop,
@@ -288,6 +349,20 @@ class Executor:
                 f"{bracket.target:.5f}".rstrip("0").rstrip("."),
                 signal.score, signal.regime, signal.conviction,
             )
+            if self._journal is not None:
+                trade_id = await self._journal.record_entry(
+                    ticker=ticker,
+                    side=signal.direction,
+                    qty=float(bracket.qty),
+                    entry_price=price,
+                    stop=bracket.stop,
+                    target=bracket.target,
+                    regime=signal.regime,
+                    conviction=signal.conviction,
+                    signal_score=signal.score,
+                )
+                if trade_id is not None:
+                    self._open_trade_ids[ticker] = trade_id
 
         except Exception as e:
             log.error("Executor error for %s: %s", ticker, e, exc_info=True)
@@ -309,6 +384,7 @@ class Executor:
                     )
                     try:
                         close_order = await self._broker.submit_market_order(ticker, pos.qty, side)
-                        self._record_close_and_update_chroma(close_order, ticker)
+                        _pnl_pct = self._record_close_and_update_chroma(close_order, ticker)
+                        self._schedule_journal_exit(ticker, close_order, _pnl_pct, "max_duration")
                     except Exception as e:
                         log.error("Duration close failed for %s: %s", ticker, e, exc_info=True)

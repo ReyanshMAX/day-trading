@@ -126,6 +126,28 @@ def test_ranging_bearish_uses_short_bias_conditions():
     assert score < -0.5
 
 
+def test_perfect_trending_short_score_below_threshold():
+    """Bearish trending regime with all bearish indicators should produce a strong negative score."""
+    snap = IndicatorSnapshot(
+        ema_fast=95.0,    # below ema_slow — bearish EMA stack
+        ema_slow=100.0,
+        vwap=100.0,
+        current_price=93.0,  # below VWAP and below orb_low
+        rsi=28.0,            # oversold from selling pressure — strong downtrend
+        macd_line=-0.5,      # bearish MACD crossover
+        macd_signal=-0.2,
+        rvol=2.0,            # elevated volume confirms move
+        orb_high=103.0,
+        orb_low=98.0,        # price (93) is well below ORB low
+        atr=1.5,
+        vwap_std=1.0,
+    )
+    regime = RegimeState(regime="trending", conviction=4, direction="bearish")
+    score = compute_score(snap, regime)
+    assert score is not None
+    assert score < -0.8
+
+
 def test_ranging_bearish_oversold_not_high_score():
     """Oversold conditions should NOT produce a strong bearish ranging score."""
     # Oversold setup — good for long ranging, NOT for bearish ranging
@@ -145,7 +167,5 @@ def test_ranging_bearish_oversold_not_high_score():
     )
     regime = RegimeState(regime="ranging", conviction=3, direction="bearish")
     score = compute_score(snap, regime)
-    assert score is not None
-    # Oversold conditions with bearish direction: short scorer finds no overbought → near zero negative
-    # (only rvol contributes, so score should be low magnitude)
-    assert score > -0.5
+    # Hard gate: RSI=30 is not overbought (need RSI > 60 for ranging short) → None
+    assert score is None

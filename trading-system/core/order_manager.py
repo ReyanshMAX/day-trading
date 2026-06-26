@@ -160,7 +160,8 @@ class OrderManager:
             risk_dollars = effective_nav * self._config.risk.max_trade_risk_pct
             raw_qty = (risk_dollars / adjusted_stop_dist) * size_mult if adjusted_stop_dist > 0 else 0
             qty_cap = max_notional / entry
-            qty_float = round(min(raw_qty, qty_cap), 4)
+            # Crypto positions are sized at 50% due to wider ATR relative to equities
+            qty_float = round(min(raw_qty, qty_cap) * 0.5, 4)
             if qty_float <= 0:
                 raise ValueError(
                     f"{ticker} fractional size resolved to 0 "

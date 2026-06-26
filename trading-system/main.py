@@ -2,14 +2,18 @@
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from pytz import timezone
 
 from core.config import load_config
 from core.logging_setup import configure_logging
 from core.broker import AlpacaBroker
+from core.forex_broker import OANDABroker
+from core.forex_stream import ForexStream
 from core.portfolio import Portfolio
 from core.order_manager import OrderManager
+from core.monitor import HealthMonitor
 from core import stream
 from signals.bar_store import BarStore
 from signals.engine import SignalEngine
@@ -65,6 +69,40 @@ async def close_all_positions_eod(
     shutdown.set()
 
 
+async def _forex_loop(config) -> None:
+    """Start OANDA forex stream if credentials are configured. Runs indefinitely."""
+    if not config.oanda_api_key or not config.oanda_account_id:
+        log.info("OANDA credentials not set — forex trading disabled")
+        return
+    if config.forex is None or not config.forex.pairs:
+        log.info("No forex pairs configured — forex trading disabled")
+        return
+
+    log.info("Starting forex stream for pairs: %s", config.forex.pairs)
+
+    async def on_forex_tick(pair: str, price: float, volume: float, ts) -> None:
+        log.debug("Forex tick: %s %.5f", pair, price)
+
+    await ForexStream(config.oanda_api_key, config.oanda_account_id).start(
+        config.forex.pairs,
+        on_forex_tick,
+    )
+
+
+async def _daily_reset_loop(portfolio: Portfolio) -> None:
+    """Resets daily P&L at 9:30 AM ET each trading day."""
+    from zoneinfo import ZoneInfo
+    from datetime import timedelta
+    et = ZoneInfo("America/New_York")
+    while True:
+        now = datetime.now(tz=et)
+        open_today = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        if now >= open_today:
+            open_today = open_today + timedelta(days=1)
+        await asyncio.sleep((open_today - now).total_seconds())
+        portfolio.reset_daily()
+
+
 async def main() -> None:
     configure_logging()
     config = load_config()
@@ -75,6 +113,7 @@ async def main() -> None:
     log.info("Alpaca connected. Paper NAV=%.2f", acct["nav"])
 
     portfolio = Portfolio(nav=config.account.nav)
+    daily_reset_task = asyncio.create_task(_daily_reset_loop(portfolio))
     positions = await broker.get_positions()
     portfolio.reconcile_positions(positions)
     regime_store = RegimeStore()
@@ -98,35 +137,52 @@ async def main() -> None:
     order_manager = OrderManager(config)
     executor = Executor(broker, portfolio, signal_engine, order_manager, gate_check, config, chroma_store=chroma)
 
+    slack_webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+    monitor = HealthMonitor(
+        broker=broker,
+        classifier=classifier,
+        slack_webhook_url=slack_webhook,
+    )
+
+    async def _on_tick(ticker: str, price: float, volume: float, ts) -> None:
+        monitor.record_tick()
+        await executor.on_tick(ticker, price, volume, ts)
+
     shutdown = asyncio.Event()
 
     log.info("Starting stream and watchers...")
     crypto_tickers = [t for t in config.universe.tickers if _is_crypto(t)]
 
     asset_cache_task = asyncio.create_task(executor.refresh_asset_cache())
+    monitor_task = asyncio.create_task(monitor.run())
 
     stream_task = asyncio.create_task(
-        stream.start(config.universe.tickers, executor.on_tick,
-                     api_key=config.alpaca_api_key, secret_key=config.alpaca_secret_key)
+        stream.start(config.universe.tickers, _on_tick,
+                     api_key=config.alpaca_api_key, secret_key=config.alpaca_secret_key,
+                     paper=config.account.paper)
     )
     watch_task = asyncio.create_task(news_watcher.watch())
     eod_task = asyncio.create_task(close_all_positions_eod(broker, portfolio, shutdown, chroma=chroma))
-    score_log_task = asyncio.create_task(signal_engine.log_scores_loop(crypto_tickers))
+    score_log_task = asyncio.create_task(signal_engine.log_scores_loop(config.universe.tickers))
     duration_task = asyncio.create_task(executor.check_position_durations())
+    forex_task = asyncio.create_task(_forex_loop(config))
 
     await shutdown.wait()
     log.info("Shutdown event set — cancelling stream and news watcher.")
     asset_cache_task.cancel()
+    monitor_task.cancel()
     stream_task.cancel()
     watch_task.cancel()
     score_log_task.cancel()
     duration_task.cancel()
+    daily_reset_task.cancel()
+    forex_task.cancel()
     results = await asyncio.gather(
-        asset_cache_task, stream_task, watch_task, eod_task,
-        score_log_task, duration_task,
+        asset_cache_task, monitor_task, stream_task, watch_task, eod_task,
+        score_log_task, duration_task, daily_reset_task, forex_task,
         return_exceptions=True,
     )
-    task_names = ["asset_cache", "stream", "news_watcher", "eod_close", "score_log", "duration_check"]
+    task_names = ["asset_cache", "monitor", "stream", "news_watcher", "eod_close", "score_log", "duration_check", "daily_reset", "forex"]
     for name, result in zip(task_names, results):
         if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
             log.critical("Task %s exited with exception: %s", name, result, exc_info=result)

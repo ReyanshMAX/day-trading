@@ -21,7 +21,7 @@ account:
   nav: 100000
 
 signal:
-  entry_threshold: 0.25
+  entry_threshold: 0.55
   atr_period: 14
   ema_fast: 9
   ema_slow: 21
@@ -30,6 +30,12 @@ signal:
   orb_window_minutes: 15
   min_bars: 30
   confidence_threshold: 0.6
+  atr_spike_multiplier: 3.0
+  rvol_trend_min: 1.5
+  rvol_ranging_min: 1.3
+  no_trade_windows:
+    - ["09:30", "09:45"]
+    - ["15:45", "16:00"]
 
 regime:
   news_poll_interval_seconds: 120
@@ -44,7 +50,7 @@ risk:
   max_trade_risk_pct: 0.01
   max_position_pct: 0.10
   max_portfolio_heat_pct: 0.06
-  max_sector_positions: 5
+  max_sector_positions: 10
   daily_loss_limit_pct: 0.03
   max_position_duration_minutes: 90
   asset_cache_refresh_seconds: 60
@@ -77,3 +83,13 @@ rr_profiles:
       3: 0.5
       4: 0.75
       5: 1.0
+
+forex:
+  pairs:
+    - "EUR/USD"
+    - "GBP/USD"
+    - "USD/JPY"
+    - "AUD/USD"
+  risk_pct: 0.005         # 0.5% NAV per forex trade (half of equity risk)
+  adx_trend_threshold: 25
+  size_unit: 1000          # minimum position: 1 micro lot
